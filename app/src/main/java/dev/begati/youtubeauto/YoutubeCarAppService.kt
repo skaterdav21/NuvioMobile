@@ -1392,7 +1392,7 @@ abstract class YoutubeEngine(val carContext: Context) {
                     override fun onRenderProcessGone(view: WebView, detail: android.webkit.RenderProcessGoneDetail): Boolean {
                         // The page's process died (low memory): rebuild on the same surface instead of taking the app down.
                         TubeLog.d("WebView renderer gone (crash=${detail.didCrash()}); rebuilding")
-                        val d = display
+                        val d = this@YoutubeEngine.display
                         val sz = displaySize
                         val sf = d?.surface
                         teardown()
