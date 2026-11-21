@@ -1,0 +1,2981 @@
+package dev.begati.youtubeauto
+
+import android.app.Activity
+import android.app.Presentation
+import android.content.ContentProvider
+import android.content.ContentValues
+import android.content.Context
+import android.content.Intent
+import android.content.SharedPreferences
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.MediaDescription
+import android.media.MediaMetadata
+import android.media.browse.MediaBrowser
+import android.media.session.MediaController
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
+import android.net.Uri
+import android.os.Bundle
+import android.os.ParcelFileDescriptor
+import android.os.SystemClock
+import android.service.media.MediaBrowserService
+import android.view.Menu
+import android.view.MenuItem
+import android.view.MotionEvent
+import android.view.View
+import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.FrameLayout
+import androidx.car.app.AppManager
+import androidx.car.app.CarAppService
+import androidx.car.app.CarContext
+import androidx.car.app.CarToast
+import androidx.car.app.Screen
+import androidx.car.app.Session
+import androidx.car.app.SurfaceCallback
+import androidx.car.app.SurfaceContainer
+import androidx.car.app.model.Action
+import androidx.car.app.model.ActionStrip
+import androidx.car.app.model.CarIcon
+import androidx.car.app.model.ListTemplate
+import androidx.car.app.model.MessageTemplate
+import androidx.car.app.model.Row
+import androidx.car.app.model.ItemList
+import androidx.car.app.model.SearchTemplate
+import androidx.car.app.model.Toggle
+import androidx.car.app.navigation.model.NavigationTemplate
+import androidx.car.app.validation.HostValidator
+import androidx.core.graphics.drawable.IconCompat
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleOwner
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
+import java.io.File
+import java.net.URL
+import org.json.JSONArray
+import org.json.JSONObject
+import org.json.JSONTokener
+import kotlin.concurrent.thread
+
+// m.youtube.com markup the injected scripts depend on. When YouTube changes its site, re-inspect the page via
+// chrome://inspect and fix the selectors here first.
+private const val PLAYER_ID = "movie_player"
+private const val MAIN_VIDEO = "#movie_player video"
+private const val PLAYER_CONTAINER = "#player-container-id"
+private const val SKIP_AD_BUTTONS = ".ytp-skip-ad-button,.ytp-ad-skip-button,.ytp-ad-skip-button-modern"
+private const val PLAYLIST_PANEL = "ytm-playlist-engagement-panel"
+// Promoted items in the feed and search, and the companion ad under the player (hidden under html.yta-noads).
+private const val FEED_ADS = "html.yta-noads ad-slot-renderer,html.yta-noads ytm-promoted-sparkles-web-renderer," +
+    "html.yta-noads ytm-companion-ad-renderer"
+// YouTube's own navigation (top bar, bottom tab bar): the car's action strip replaces it. ytm-app keeps 48 px of
+// padding for the top bar and the feed's chip bar is fixed under it, so both move up.
+private const val YT_NAV = "ytm-mobile-topbar-renderer,ytm-pivot-bar-renderer"
+private const val YT_NAV_GAPS = "ytm-app{padding-top:0!important}ytm-feed-filter-chip-bar-renderer{top:0!important}"
+// Google sign-in links ("Fazer login" rows and buttons, like buttons while signed out): sign-in happens on the phone.
+// Feed and search titles cap their height in px for the default font size; the car's text zoom (130% by default) makes two lines
+// taller than that and cuts the second one. The 2-line clamp still applies.
+// History rows (compact items) and the library's video and playlist shelves (cards) cap titles and the channel + views
+// block the same way.
+private const val TITLE_FIT = ".ytLockupMetadataViewModelTitle,.ytLockupMetadataViewModelHeadingReset,.media-item-headline,.media-item-metadata," +
+    ".YtmCompactMediaItemSubhead,.YtmCompactMediaItemMetadataContent,.YtmCompactMediaItemHost," +
+    ".video-card-title,.video-card-subhead,.video-card-metadata,.playlist-card-title,.playlist-card-subhead,.playlist-card-metadata" +
+    "{max-height:none!important;height:auto!important}"
+private const val SIGN_IN_LINKS = "a[href*=\"accounts.google.com\"],ytm-button-renderer:has(>a[href*=\"accounts.google.com\"])"
+
+// Sets the saved quality on the current video; stamps the time so the resulting change event isn't saved as a pick.
+private const val JS_APPLY_QUALITY =
+    "(p=>{if(p&&p.setPlaybackQualityRange){window.__ytaQAt=Date.now();const q=yta.quality();p.setPlaybackQualityRange(q,q)}})" +
+        "(document.getElementById('${PLAYER_ID}'))"
+
+// Sets the saved speed and turns captions on/off on the current video. load/unloadModule is used because
+// toggleSubtitlesOn proved unreliable on m.youtube.com (stale isSubtitlesOn, toggles ignored).
+// ponytail: internal player API of m.youtube.com, re-check via chrome://inspect if speed or captions stop applying
+private const val JS_APPLY_PLAYBACK =
+    "(p=>{if(!p||!p.setPlaybackRate)return;window.__ytaRAt=Date.now();p.setPlaybackRate(+yta.speed());" +
+        "p[yta.flag('captions')?'loadModule':'unloadModule']('captions')})(document.getElementById('${PLAYER_ID}'))"
+
+// Injected on every full page load (m.youtube.com is a SPA, so the guard keeps it to once per window):
+// - fakes a visible page so YouTube keeps playing while the car shows another app (Maps etc.), if "background" is on
+// - reports play/pause of the main player (not feed previews) and the video's title/channel/thumbnail to the app through the `yta` bridge
+//   (from the page's navigator.mediaSession, falling back to document.title, the player's author and the ytimg thumbnail)
+// - hides the playlist "Próximo / Mix de ..." bar that covers the player on short car screens
+// - hides promoted items in the feed and search (FEED_ADS), if "skipAds" is on
+// - hides YouTube's top bar and tab bar (YT_NAV) and its sign-in links (SIGN_IN_LINKS)
+// - stretches the player over the whole screen on /watch pages (polled, SPA navigation has no load event), if "fullscreen" is on,
+//   with the video's object-fit from yta.aspect() (Ajustar/Preencher/Esticar)
+// - runs ads to their end and clicks "Pular anúncio", if "skipAds" is on (ads that got past assets/page_start.js)
+// - keeps captions unloaded whenever YouTube turns them on by itself, while "captions" is off
+// Flags are read through the bridge on every use, so settings changes apply without a reload.
+// - starts each video at the saved default quality (360p unless changed); applied once per video id, and ads
+//   have their own id so they don't eat it. A quality picked later in the player menu becomes the new default.
+// - same per-video moment: applies the saved speed (a speed picked in the player becomes the default too)
+//   and captions on/off
+// - reports the watch position every 500 ms so a rebuilt car screen resumes where it was
+// - opens /shorts/<id> as /watch?v=<id> (the shorts page blocks playback behind an "open the app" dialog)
+// - unmutes a video that autoplayed muted (opened from the phone or the media card), during its first 5 s
+// ponytail: tied to m.youtube.com markup; re-inspect via chrome://inspect when YouTube changes it
+private const val PAGE_JS =
+    "(()=>{if(window.__yta)return;window.__yta=1;" +
+        "const P=Document.prototype,H=Object.getOwnPropertyDescriptor(P,'hidden').get," +
+        "V=Object.getOwnPropertyDescriptor(P,'visibilityState').get;" +
+        "Object.defineProperty(document,'hidden',{get(){return yta.flag('background')?false:H.call(this)}});" +
+        "Object.defineProperty(document,'visibilityState',{get(){return yta.flag('background')?'visible':V.call(this)}});" +
+        "window.addEventListener('visibilitychange',e=>{if(yta.flag('background'))e.stopImmediatePropagation()},true);" +
+        "const meta=()=>{const m=navigator.mediaSession&&navigator.mediaSession.metadata;" +
+        "const id=new URLSearchParams(location.search).get('v');" +
+        "const pv=document.getElementById('${PLAYER_ID}'),vd=pv&&pv.getVideoData&&pv.getVideoData();" +
+        // document.title is a bare "YouTube" until the page fills it in: skip that placeholder.
+        "const tt=m&&m.title||document.title.replace(/ - YouTube\$/,'');if(tt==='YouTube')return;" +
+        "yta.meta(tt,m&&m.artist||vd&&vd.author||''," +
+        "m&&m.artwork&&m.artwork.length?m.artwork[m.artwork.length-1].src:(id?'https://i.ytimg.com/vi/'+id+'/hqdefault.jpg':''))};" +
+        // Only the main player (watch page or miniplayer) counts: a feed preview playing is not "a video playing".
+        "const main=e=>e.target.closest&&!!e.target.closest('#${PLAYER_ID}');" +
+        "document.addEventListener('play',e=>{if(!main(e))return;yta.playing(true);meta();setTimeout(meta,1500)},true);" +
+        "document.addEventListener('pause',e=>main(e)&&yta.playing(false),true);" +
+        "let qId='';document.addEventListener('play',()=>{const p=document.getElementById('${PLAYER_ID}');" +
+        "const id=p&&p.getVideoData&&p.getVideoData().video_id;" +
+        "if(!id||id===qId||!p.setPlaybackQualityRange)return;qId=id;" + JS_APPLY_QUALITY + ";" + JS_APPLY_PLAYBACK + ";" +
+        // Changes in the first 5 s are our own call or a video lacking that quality, not the user's pick.
+        "if(!p.__yta){p.__yta=1;p.addEventListener('onPlaybackQualityChange'," +
+        "v=>{if(Date.now()-window.__ytaQAt>5000&&yta.quality()!=='auto')yta.saveQuality(v)});" +
+        // Same for speed; the id check also skips YouTube resetting the rate as the next video loads.
+        "p.addEventListener('onPlaybackRateChange',r=>{if(Date.now()-window.__ytaRAt>2000&&" +
+        "p.getVideoData().video_id===qId)yta.saveSpeed(String(r))})}},true);" +
+        "const s=document.createElement('style');" +
+        "s.textContent='${PLAYLIST_PANEL}{display:none!important}" +
+        "${FEED_ADS}{display:none!important}" +
+        "${YT_NAV},${SIGN_IN_LINKS}{display:none!important}${YT_NAV_GAPS}${TITLE_FIT}" +
+        // Fullscreen video: the host's strips sit over the player's top corner and already have play/pause, the media
+        // bar and the steering wheel have previous and next, and the car settings have captions and quality. YouTube's
+        // top controls and middle buttons would only repeat them, so they hide in every player state (spec
+        // player-controls); the progress bar and time stay for the tap-to-seek.
+        "html.yta-watch player-top-controls{display:none!important}" +
+        "html.yta-watch player-middle-controls,html.yta-watch player-middle-controls *{visibility:hidden!important}" +
+        // YouTube's fullscreen button: the car video already fills the screen and the aspect is the host's button.
+        "html.yta-watch .ytwPlayerBottomControlsFullscreenButtonWrapper,html.yta-watch .ytwPlayerBottomControlsFullscreenButtonWrapper *" +
+        "{visibility:hidden!important}" +
+        "html.yta-watch ${PLAYER_CONTAINER}{position:fixed!important;inset:0!important;" +
+        "width:100vw!important;height:100vh!important;z-index:99999!important;background:#000!important}" +
+        // Wrappers between the container and the video (#player keeps an aspect-ratio padding, the video
+        // container has height 0): without this the video gets 100% of 0 px and the screen stays black.
+        "html.yta-watch ${PLAYER_CONTAINER} #player,html.yta-watch ${PLAYER_CONTAINER} .html5-video-container" +
+        "{position:absolute!important;inset:0!important;width:100%!important;height:100%!important;padding:0!important}" +
+        "html.yta-watch ${PLAYER_CONTAINER} .html5-video-player,html.yta-watch ${PLAYER_CONTAINER} video" +
+        "{width:100%!important;height:100%!important;left:0!important;top:0!important;object-fit:var(--yta-fit,contain)!important}';" +
+        "document.head.appendChild(s);" +
+        "let umId='',umN=0,pl=null;setInterval(()=>{" +
+        // Shorts pages on m.youtube.com block playback behind an "Assistir no app YouTube" dialog; the watch page of
+        // the same id plays normally, so open that instead (as videos sent from the phone do).
+        "const sh=location.pathname.match(/^\\/shorts\\/([\\w-]{11})/);if(sh){location.replace('/watch?v='+sh[1]);return}" +
+        // Play/pause and metadata also by polling: a video that starts before this script is injected (loadUrl from
+        // the phone or the media card) fires its play event too early to be heard.
+        // pl starts unknown so a new document (Início after a video) reports its state even when nothing plays.
+        "const v=document.querySelector('${MAIN_VIDEO}'),on=!!v&&!v.paused&&!v.ended;if(on!==pl){pl=on;yta.playing(on)}" +
+        // Title and channel fill in late after a load (document.title is "YouTube" at first): report while playing;
+        // the app drops repeats.
+        "if(on&&location.pathname==='/watch')meta();" +
+        "document.documentElement.classList.toggle('yta-watch'," +
+        "yta.flag('fullscreen')&&location.pathname==='/watch');" +
+        "document.documentElement.style.setProperty('--yta-fit',yta.aspect());" +
+        "document.documentElement.classList.toggle('yta-noads',yta.flag('skipAds'));" +
+        // Only the URL's own video counts: during an ad the player reports the ad's id and time.
+        "const p=document.getElementById('${PLAYER_ID}'),id=new URLSearchParams(location.search).get('v');" +
+        // End of the video (spec video-end), with the last autoplay state YouTube's toggle showed: the toggle is only in
+        // the page on some videos, so -1 when it was never seen. Reported while ended and once when that changes.
+        "const at=document.querySelector('.ytwAutonavToggleButtonHost');if(at)window.__ytaAn=at.getAttribute('aria-pressed')==='true';" +
+        "const en=!!p&&!!p.getPlayerState&&p.getPlayerState()===0&&location.pathname==='/watch';" +
+        "if(en||en!==window.__ytaEn){window.__ytaEn=en;yta.ended(en,window.__ytaAn===undefined?-1:window.__ytaAn?1:0)}" +
+        // Previous and next of YouTube's player (spec prev-next): its own buttons stay in the page while hidden, the
+        // first one previous and the second next; enabled means there is a video to go to. Reported when that changes.
+        "const nb=[...document.querySelectorAll('.player-middle-controls-prev-next-button')].map(b=>!b.classList.contains('icon-disable'));" +
+        "const nk=id+','+(nb[0]===true)+','+(nb[1]===true);if(nk!==window.__ytaNb){window.__ytaNb=nk;yta.neighbors(nb[0]===true,nb[1]===true)}" +
+        // Ads: unskippable ones have no button, and YouTube may ignore a scripted click, so the ad is also run to
+        // its end (the player then moves on to the video by itself).
+        "const ad=!!p&&p.classList.contains('ad-showing');" +
+        "if(ad&&yta.flag('skipAds')){" +
+        "if(v&&v.duration>0&&isFinite(v.duration)&&v.currentTime<v.duration-0.1)v.currentTime=v.duration;" +
+        "document.querySelector('${SKIP_AD_BUTTONS}')?.click()}" +
+        // YouTube turns (auto-generated) captions on by itself after our per-video apply: around ads, as a muted
+        // autoplay is unmuted and, on a fresh install, after a seek (a SponsorBlock skip). While captions are off in
+        // the settings they are unloaded whenever they show up, the player's own CC button included.
+        "if(p&&p.getOption&&!ad&&!yta.flag('captions')){" +
+        "const t=p.getOption('captions','track');if(t&&t.languageCode)p.unloadModule('captions')}" +
+        // A video opened without a tap on the car (phone remote, media card) autoplays muted, and the player mutes it
+        // again right after the play event; unmute during its first 5 s of playback, so a later mute by hand sticks.
+        "if(id&&p&&p.isMuted&&p.getPlayerState()===1&&p.getVideoData().video_id===id){if(id!==umId){umId=id;umN=0}if(umN++<10&&p.isMuted())p.unMute()}" +
+        "if(id&&p&&p.getVideoData&&p.getVideoData().video_id===id)yta.time(id,Math.floor(p.getCurrentTime()),Math.floor(p.getDuration()||0),p.getPlaybackRate?p.getPlaybackRate():1)},500)})()"
+
+// Phone page (once per document): the phone is a remote, so it never plays.
+// - a tap on a video link (capture phase, before YouTube's own handlers) goes to remote.cast and is cancelled
+//   when the link has a video id; links without one are left alone
+// - landing on /watch or /shorts some other way (autoplay, SPA navigation) goes back and casts that page
+// - every <video> that starts playing (feed previews included) is paused
+// ponytail: tied to m.youtube.com markup and routing; re-check via chrome://inspect if videos start playing on the phone
+private const val PHONE_JS =
+    "(()=>{if(window.__ytr)return;window.__ytr=1;" +
+        "const abs=h=>new URL(h,location.href).href;" +
+        "document.addEventListener('click',e=>{const a=e.target.closest&&e.target.closest('a[href]');" +
+        "if(a&&remote.cast(abs(a.getAttribute('href')))){e.preventDefault();e.stopImmediatePropagation()}},true);" +
+        "document.addEventListener('play',e=>e.target.pause&&e.target.pause(),true);" +
+        "let last='';setInterval(()=>{document.querySelectorAll('video').forEach(v=>v.paused||v.pause());" +
+        "if(!/^\\/(watch|shorts\\/)/.test(location.pathname))last='';" +
+        "else if(location.href!==last){last=location.href;if(remote.cast(last))history.back()}},300)})()"
+
+// Controls act on the main player (watch page or miniplayer), the same video whose state yta.playing reports.
+private const val JS_PLAY = "document.querySelector('${MAIN_VIDEO}')?.play()"
+private const val JS_PAUSE = "document.querySelector('${MAIN_VIDEO}')?.pause()"
+private const val JS_TOGGLE = "(v=>v&&(v.paused?v.play():v.pause()))(document.querySelector('${MAIN_VIDEO}'))"
+internal const val JS_RESTART = "(v=>v&&(v.currentTime=0))(document.querySelector('${MAIN_VIDEO}'))"
+// Moves the main video [seconds] back (negative) or forward, within the video.
+private fun jsSeekBy(seconds: Int) =
+    "(v=>v&&(v.currentTime=Math.max(0,Math.min(v.duration||1e9,v.currentTime+($seconds)))))(document.querySelector('${MAIN_VIDEO}'))"
+// Puts the main video at [seconds].
+private fun jsSeekTo(seconds: Double) = "(v=>v&&(v.currentTime=$seconds))(document.querySelector('${MAIN_VIDEO}'))"
+// Player's own "next": the playlist's next item, or the autoplay pick outside a playlist.
+internal const val JS_PREVIOUS = "document.getElementById('${PLAYER_ID}')?.previousVideo?.()"
+private const val JS_NEXT = "document.getElementById('${PLAYER_ID}')?.nextVideo?.()"
+// Player and progress bar rects in page px (the bar only while YouTube's controls show it), and the main video's time.
+private const val PROGRESS_BAR = ".ytPlayerProgressBarDragContainer"
+private const val JS_GEOMETRY =
+    "(()=>{const r=e=>{if(!e)return null;const b=e.getBoundingClientRect();return[b.left,b.top,b.right,b.bottom]};" +
+        "const v=document.querySelector('${MAIN_VIDEO}'),b=document.querySelector('${PROGRESS_BAR}');" +
+        "return{p:r(document.getElementById('${PLAYER_ID}')),b:b&&getComputedStyle(b).visibility==='visible'?r(b):null," +
+        "d:v&&isFinite(v.duration)?v.duration:0,t:v?v.currentTime:0}})()"
+
+// Player quality names (YouTube's) -> label string ids. "medium" (360p) is the bandwidth-saving default.
+internal val QUALITIES = linkedMapOf(
+    // Six options: car hosts truncate lists while driving, and 144p isn't worth a slot.
+    "auto" to R.string.quality_auto, "small" to R.string.quality_240, "medium" to R.string.quality_360,
+    "large" to R.string.quality_480, "hd720" to R.string.quality_720, "hd1080" to R.string.quality_1080,
+)
+
+// Settings, shared by the car's SettingsScreen and the phone's menu. Stored values are the option keys;
+// titles and option labels are string resource ids, resolved in the device's language.
+internal class Choice(val key: String, val title: Int, val options: Map<String, Int>, val default: String)
+internal class Flag(val key: String, val title: Int, val default: Boolean = true)
+
+internal val QUALITY = Choice("quality", R.string.quality_title, QUALITIES, "medium")
+internal val SPEED = Choice(
+    "speed", R.string.speed_title,
+    linkedMapOf(
+        "0.75" to R.string.speed_075, "1" to R.string.speed_normal, "1.25" to R.string.speed_125,
+        "1.5" to R.string.speed_150, "1.75" to R.string.speed_175, "2" to R.string.speed_200,
+    ),
+    "1",
+)
+internal val HOME_PAGE = Choice(
+    "home", R.string.home_title,
+    linkedMapOf(
+        "https://m.youtube.com" to R.string.home_home,
+        "https://m.youtube.com/feed/subscriptions" to R.string.subscriptions,
+        "https://m.youtube.com/feed/history" to R.string.history,
+    ),
+    "https://m.youtube.com",
+)
+internal val TEXT_ZOOM = Choice(
+    "textZoom", R.string.text_size_title,
+    linkedMapOf("100" to R.string.zoom_100, "115" to R.string.zoom_115, "130" to R.string.zoom_130, "150" to R.string.zoom_150),
+    "130",
+)
+// Keys are the CSS object-fit values applied to the video on /watch.
+internal val ASPECT = Choice(
+    "aspect", R.string.aspect_title,
+    linkedMapOf("contain" to R.string.aspect_fit, "cover" to R.string.aspect_fill, "fill" to R.string.aspect_stretch),
+    "cover", // fills the car screen; the button switches it (and the switch is kept, see nextAspect)
+)
+internal val CHOICES = listOf(QUALITY, SPEED, ASPECT, HOME_PAGE, TEXT_ZOOM) + TUBE_CHOICES
+// Flags default to on (the behavior before they were settings), except captions and audio-only while moving.
+internal val FLAGS = listOf(
+    Flag("skipAds", R.string.flag_skip_ads),
+    Flag("sponsorBlock", R.string.flag_sponsor_block),
+    Flag("audioWhileMoving", R.string.flag_audio_while_moving, default = false),
+    Flag("fullscreen", R.string.flag_fullscreen),
+    Flag("background", R.string.flag_background),
+    Flag("captions", R.string.flag_captions, default = false),
+    Flag("navOverlay", R.string.flag_nav_overlay), // needs notification access, asked on the phone (see Prefs)
+) + TUBE_FLAGS
+
+// Car settings (setting key, icon), in order: only what a driver changes while watching; the rest is on the phone.
+internal val CAR_SETTINGS = listOf(
+    QUALITY.key to R.drawable.ic_high_quality,
+    DATA_SAVER.key to R.drawable.ic_wifi_off,
+    SPEED.key to R.drawable.ic_speed,
+    "captions" to R.drawable.ic_closed_caption,
+    "navOverlay" to R.drawable.ic_navigation,
+)
+
+// Phone settings layout: group title -> setting keys, in order. Keys are those of CHOICES and FLAGS, unchanged.
+internal val PHONE_GROUPS = listOf(
+    R.string.group_playback to listOf("quality", "speed", "aspect", "captions", "fullscreen"),
+    R.string.group_ads to listOf("skipAds", "sponsorBlock"),
+    R.string.group_car to listOf("audioWhileMoving", "background", "navOverlay", "home", "textZoom"),
+) + TUBE_GROUPS
+// Phone settings row icon per setting key.
+internal val SETTING_ICONS = mapOf(
+    "quality" to R.drawable.ic_high_quality, "speed" to R.drawable.ic_speed, "aspect" to R.drawable.ic_aspect_ratio,
+    "captions" to R.drawable.ic_closed_caption, "fullscreen" to R.drawable.ic_fullscreen, "skipAds" to R.drawable.ic_block,
+    "sponsorBlock" to R.drawable.ic_fast_forward, "audioWhileMoving" to R.drawable.ic_headphones,
+    "background" to R.drawable.ic_picture_in_picture_alt, "home" to R.drawable.ic_home, "textZoom" to R.drawable.ic_format_size,
+    "navOverlay" to R.drawable.ic_navigation,
+) + TUBE_ICONS
+// Summary shown under each phone switch: what it does, in the driver's words.
+internal val SWITCH_SUMMARIES = mapOf(
+    "skipAds" to R.string.summary_skip_ads, "sponsorBlock" to R.string.summary_sponsor_block,
+    "audioWhileMoving" to R.string.summary_audio_while_moving, "fullscreen" to R.string.summary_fullscreen,
+    "background" to R.string.summary_background, "captions" to R.string.summary_captions,
+    "navOverlay" to R.string.summary_nav_overlay,
+) + TUBE_SUMMARIES
+
+// Label of option [key] of [c], in the device's language.
+internal fun Context.label(c: Choice, key: String) = getString(c.options.getValue(key))
+
+internal fun prefs(ctx: Context) = ctx.getSharedPreferences("settings", Context.MODE_PRIVATE)
+internal fun choice(prefs: SharedPreferences, c: Choice) = prefs.getString(c.key, null)?.takeIf { it in c.options } ?: c.default
+internal fun setChoice(prefs: SharedPreferences, c: Choice, v: String) {
+    if (v in c.options) prefs.edit().putString(c.key, v).apply()
+}
+internal fun flag(prefs: SharedPreferences, key: String) =
+    if (key in BASIC_OFF && key != "basicMode" && prefs.getBoolean("basicMode", false)) false
+    else prefs.getBoolean(key, FLAGS.find { it.key == key }?.default ?: true)
+internal fun setFlag(prefs: SharedPreferences, key: String, on: Boolean) = prefs.edit().putBoolean(key, on).apply()
+
+// Aspect button (car and phone): saves the next mode in ASPECT's order (Ajustar -> Preencher -> Esticar -> Ajustar)
+// as the default, so the pick stays for every video and run.
+internal fun nextAspect(prefs: SharedPreferences): String {
+    val keys = ASPECT.options.keys.toList()
+    return keys[(keys.indexOf(choice(prefs, ASPECT)) + 1) % keys.size].also { setChoice(prefs, ASPECT, it) }
+}
+
+// Car aspect button icon for aspect [aspect] (an ASPECT key): Ajustar, Preencher, Esticar.
+internal fun aspectIcon(aspect: String) = when (aspect) {
+    "contain" -> R.drawable.ic_fit_screen
+    "cover" -> R.drawable.ic_crop
+    else -> R.drawable.ic_open_in_full
+}
+
+// Car home menu (url, title string id, icon): the pages YouTube's hidden tab bar led to. Playlists is its own feed
+// (the library page is YouTube's "You" page, profile and history first).
+internal val HOME_MENU = listOf(
+    Triple("https://m.youtube.com", R.string.home_home, R.drawable.ic_home),
+    Triple("https://m.youtube.com/feed/subscriptions", R.string.subscriptions, R.drawable.ic_subscriptions),
+    Triple("https://m.youtube.com/feed/history", R.string.history, R.drawable.ic_history),
+    Triple("https://m.youtube.com/feed/playlists", R.string.playlists, R.drawable.ic_video_library),
+)
+
+// Page the car screen opens on: the last one shown in this process, else the chosen home page.
+internal fun startUrl(prefs: SharedPreferences, lastPage: String) = lastPage.ifEmpty { choice(prefs, HOME_PAGE) }
+
+// Home button label (string id): the chosen home page's name (Home / Subscriptions / History).
+internal fun homeLabel(prefs: SharedPreferences) = HOME_PAGE.options.getValue(choice(prefs, HOME_PAGE))
+
+internal fun choice(ctx: Context, c: Choice) = choice(prefs(ctx), c)
+internal fun setChoice(ctx: Context, c: Choice, v: String) = setChoice(prefs(ctx), c, v)
+internal fun flag(ctx: Context, key: String) = flag(prefs(ctx), key)
+internal fun setFlag(ctx: Context, key: String, on: Boolean) = setFlag(prefs(ctx), key, on)
+
+class YoutubeCarAppService : CarAppService() {
+    // ponytail: accepts any host, fine for a sideloaded personal app; restrict to Google's hosts if ever published
+    override fun createHostValidator() = HostValidator.ALLOW_ALL_HOSTS_VALIDATOR
+
+    // Android Auto opening a car session: the same notification as the media card's (spec install-check, INST-07).
+    override fun onCreateSession() = object : Session() {
+        init { if (notifyOnSession(applicationContext.installWarningNow())) applicationContext.notifyWrongInstall() }
+
+        override fun onCreateScreen(intent: Intent): Screen = YoutubeScreen(carContext)
+    }
+}
+
+// One MediaSession per process: the car screen drives it, MediaService exposes it to Android Auto's
+// media UI (now-playing card, wheel keys, browse list). Main thread only, all callers run there.
+private var sharedSession: MediaSession? = null
+
+// Last page shown in the car, SPA navigations included. Process-wide so it also survives the car
+// screen being recreated (e.g. a host that ends the session while the reverse camera is up).
+internal var pageUrl = ""
+
+// Video picked from the car's media list while the navigation screen was closed; it opens it on start.
+private var pendingUrl: String? = null
+
+// Last watch position reported by the page (videoId to seconds); process-wide like pageUrl.
+internal var resumeAt: Pair<String, Int>? = null
+
+// The live car screen, for what the phone remote controls beyond the media session; null while there's none.
+internal var carLink: YoutubeEngine? = null
+
+// Next aspect (car button and phone remote), saved; returns its label. The page picks it up on its next poll.
+internal fun cycleAspect(ctx: Context) = ctx.label(ASPECT, nextAspect(prefs(ctx)))
+
+/** [url] with `t=` set to the saved position when it is a watch page of that same video, else [url]. */
+internal fun withResume(url: String, at: Pair<String, Int>?): String {
+    if (at == null || at.second < 5) return url
+    val id = Regex("[?&]v=([^&#]+)").find(url)?.groupValues?.get(1)
+    if (id != at.first || !url.contains("/watch?")) return url
+    return url.replace(Regex("&t=[^&#]*"), "") + "&t=${at.second}s"
+}
+
+/**
+ * WebView bounds (left, top, right, bottom) on a [w] x [h] surface, from the host's visible area.
+ * A side the host insets by a third of the surface or less (its margin, the auto-hiding action strips) is
+ * covered, so the buttons float over the page; a deeper inset is a media card beside the app, and the page
+ * stops at it. No area yet: the whole surface.
+ */
+// ponytail: one-third threshold from DHU measures (strips inset 88 of 400/800, the card 336 of 800); retune per host if a card gets covered
+internal fun webViewBounds(w: Int, h: Int, area: List<Int>?): List<Int> {
+    val full = listOf(0, 0, w, h)
+    val (l, t, r, b) = area ?: return full
+    val bounds = listOf(
+        if (l > w / 3) l.coerceAtMost(w) else 0,
+        if (t > h / 3) t.coerceAtMost(h) else 0,
+        if (w - r > w / 3) r.coerceAtLeast(0) else w,
+        if (h - b > h / 3) b.coerceAtLeast(0) else h,
+    )
+    // An empty, inverted or stale rect (from before a surface resize) leaves nothing: show the whole page instead.
+    return if (bounds[0] < bounds[2] && bounds[1] < bounds[3]) bounds else full
+}
+
+// Watch page the car opens for a video id (from the phone, the media list or a short).
+internal fun watchUrl(videoId: String) = "https://m.youtube.com/watch?v=" + java.net.URLEncoder.encode(videoId, "UTF-8")
+
+// Callback while no car screen is alive: the WebView (the actual player) only exists in that screen.
+private val idleCallback = object : MediaSession.Callback() {
+    override fun onPlayFromMediaId(mediaId: String, extras: Bundle?) = waitForCar(watchUrl(mediaId))
+    override fun onPlayFromSearch(query: String?, extras: Bundle?) = searchToPlay(query, ::waitForCar)
+    override fun onCustomAction(action: String, extras: Bundle?) {
+        when (action) {
+            REMOTE_SEARCH -> extras?.getString("q")?.takeIf { it.isNotBlank() }?.let { waitForCar(searchUrl(it.trim())) }
+            REMOTE_OPEN -> extras?.getString("url")?.let(::waitForCar)
+        }
+    }
+}
+
+private fun waitForCar(url: String) {
+    pendingUrl = url
+    sharedSession?.setPlaybackState(waitingForCar())
+}
+
+// Search results page the car opens for [query].
+internal fun searchUrl(query: String) = "https://m.youtube.com/results?search_query=" + java.net.URLEncoder.encode(query, "UTF-8")
+
+/**
+ * Voice ("Ok Google, play X on YT Auto"): looks up [query] and calls [open] on the main thread with the first
+ * result's watch page, or the results page when the lookup finds nothing or fails. A blank query does nothing.
+ */
+private fun searchToPlay(query: String?, open: (String) -> Unit) {
+    if (query.isNullOrBlank()) return
+    thread {
+        val id = runCatching {
+            parseFeed(fetchHtml("https://www.youtube.com/results?search_query=" + java.net.URLEncoder.encode(query, "UTF-8"))).firstOrNull()?.id
+        }.getOrNull()
+        android.os.Handler(android.os.Looper.getMainLooper()).post { open(id?.let(::watchUrl) ?: searchUrl(query)) }
+    }
+}
+
+// Set by mediaSession(), which runs before anything can ask for waitingForCar().
+private lateinit var appContext: Context
+
+// Session state while a video waits for the car screen to be opened; the phone bar shows its message.
+// Built per call so the message follows a language change.
+private fun waitingForCar() = PlaybackState.Builder()
+    .setState(PlaybackState.STATE_ERROR, PlaybackState.PLAYBACK_POSITION_UNKNOWN, 0f)
+    .setErrorMessage(appContext.getString(R.string.open_car_to_play))
+    .build()
+
+// The car player exists, so the car app is open or playing in the background. Android Auto keeps the car service
+// and its screen alive after the app is closed, so a screen alone doesn't mean that.
+internal fun carPlaying() = carLink?.hasPlayer == true
+
+internal fun mediaSession(ctx: Context) = sharedSession
+    ?: MediaSession(ctx.applicationContext.also { appContext = it }, "yt-auto").also {
+        it.setCallback(idleCallback)
+        it.setPlaybackState(playbackState(false))
+        it.isActive = true
+        sharedSession = it
+    }
+
+// Custom actions of the session: 10 s back and forward.
+internal const val REWIND = "rewind"
+internal const val FORWARD = "forward"
+// Phone remote only (not advertised on the car's media card).
+internal const val REMOTE_SEARCH = "tube.search"
+internal const val REMOTE_HOME = "tube.home"
+internal const val REMOTE_BACK = "tube.back"
+internal const val REMOTE_AUDIO = "tube.audio"
+internal const val REMOTE_ASPECT = "tube.aspect"
+internal const val REMOTE_OPEN = "tube.open"
+
+// [positionMs] is extrapolated by readers (car media card, phone bar) while playing, so a report every 500 ms is enough.
+private fun playbackState(playing: Boolean, positionMs: Long = PlaybackState.PLAYBACK_POSITION_UNKNOWN, rate: Float = 1f): PlaybackState =
+    PlaybackState.Builder()
+        .setActions(
+            PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE or
+                PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS or
+                PlaybackState.ACTION_PLAY_FROM_MEDIA_ID or PlaybackState.ACTION_PLAY_FROM_SEARCH
+            // No ACTION_SEEK_TO: with it Android Auto swaps previous/next for -10/+10 s on its media card (session
+            // extras don't stop it). onSeekTo still runs for the phone bar, which calls seekTo directly.
+            // -10/+10 s come as custom actions instead, beside previous/next.
+        )
+        .addCustomAction(PlaybackState.CustomAction.Builder(REWIND, appContext.getString(R.string.rewind_10), R.drawable.ic_rewind).build())
+        .addCustomAction(PlaybackState.CustomAction.Builder(FORWARD, appContext.getString(R.string.forward_10), R.drawable.ic_forward).build())
+        .setState(if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED, positionMs, rate)
+        .build()
+
+// Browse tree: root -> History / Subscriptions / Watch later / Liked -> videos (mediaId = videoId),
+// and root -> Playlists -> the account's playlists (mediaId = "list:<id>") -> videos.
+private val FEEDS = linkedMapOf(
+    "history" to (R.string.history to "https://www.youtube.com/feed/history"),
+    "subscriptions" to (R.string.subscriptions to "https://www.youtube.com/feed/subscriptions"),
+    "watch_later" to (R.string.watch_later to "https://www.youtube.com/playlist?list=WL"),
+    "liked" to (R.string.liked to "https://www.youtube.com/playlist?list=LL"),
+)
+private const val PLAYLISTS = "playlists"
+private const val LIST_PREFIX = "list:"
+private val PLAYLIST_ID = Regex("[A-Za-z0-9_-]{2,64}")
+
+/** Feed page of a browse node: a fixed feed or "list:<playlist id>"; null for anything else. */
+internal fun feedUrl(mediaId: String): String? = FEEDS[mediaId]?.second
+    ?: mediaId.removePrefix(LIST_PREFIX).takeIf { mediaId.startsWith(LIST_PREFIX) && PLAYLIST_ID.matches(it) }
+        ?.let { "https://www.youtube.com/playlist?list=$it" }
+
+/** Plain text of a YouTube text object: {simpleText}, {runs:[{text}]} or {content}. */
+private fun ytText(o: Any?): String? = (o as? JSONObject)?.let { t ->
+    t.optString("simpleText").ifEmpty { null }
+        ?: t.optJSONArray("runs")?.let { r -> (0 until r.length()).joinToString("") { r.optJSONObject(it)?.optString("text").orEmpty() } }?.ifEmpty { null }
+        ?: t.optString("content").ifEmpty { null }
+}
+
+/** Collects videoId -> (title, channel) from any renderer shape in ytInitialData, in page order. */
+private fun collectVideos(v: Any?, out: LinkedHashMap<String, Pair<String, String>>) {
+    when (v) {
+        is JSONObject -> {
+            val id = v.optString("videoId").ifEmpty {
+                if (v.optString("contentType") == "LOCKUP_CONTENT_TYPE_VIDEO") v.optString("contentId") else ""
+            }
+            val lockup = v.optJSONObject("metadata")?.optJSONObject("lockupMetadataViewModel")
+            val title = ytText(v.opt("title")) ?: ytText(v.opt("headline")) ?: ytText(lockup?.opt("title"))
+            if (id.isNotEmpty() && title != null && id !in out) {
+                out[id] = title to (ytText(v.opt("shortBylineText")) ?: ytText(v.opt("ownerText")) ?: "")
+            }
+            for (k in v.keys()) collectVideos(v.opt(k), out)
+        }
+        is JSONArray -> for (i in 0 until v.length()) collectVideos(v.opt(i), out)
+    }
+}
+
+internal data class FeedVideo(val id: String, val title: String, val channel: String)
+
+/**
+ * Playlists (id to title) on the account's playlists page, in page order, first occurrence only, at most 50.
+ * Watch later and Liked are left out: they have their own entries.
+ */
+internal fun parsePlaylists(html: String): List<Pair<String, String>> {
+    val marker = "var ytInitialData = "
+    val start = html.indexOf(marker).takeIf { it >= 0 } ?: return emptyList()
+    val out = LinkedHashMap<String, String>()
+    fun walk(v: Any?) {
+        when (v) {
+            is JSONObject -> {
+                // Old grid renderers carry playlistId; lockups carry contentId with a playlist content type.
+                val id = v.optString("playlistId").ifEmpty {
+                    if (v.optString("contentType") == "LOCKUP_CONTENT_TYPE_PLAYLIST") v.optString("contentId") else ""
+                }
+                val lockup = v.optJSONObject("metadata")?.optJSONObject("lockupMetadataViewModel")
+                val title = ytText(v.opt("title")) ?: ytText(lockup?.opt("title"))
+                if (PLAYLIST_ID.matches(id) && id != "WL" && id != "LL" && title != null && id !in out) out[id] = title
+                for (k in v.keys()) walk(v.opt(k))
+            }
+            is JSONArray -> for (i in 0 until v.length()) walk(v.opt(i))
+        }
+    }
+    walk(JSONTokener(html.substring(start + marker.length)).nextValue())
+    return out.entries.take(50).map { it.key to it.value }
+}
+
+/** Videos of a feed page's ytInitialData, in page order, first occurrence only, at most 50. */
+internal fun parseFeed(html: String): List<FeedVideo> {
+    val marker = "var ytInitialData = "
+    val start = html.indexOf(marker).takeIf { it >= 0 } ?: return emptyList()
+    val data = JSONTokener(html.substring(start + marker.length)).nextValue()
+    val videos = LinkedHashMap<String, Pair<String, String>>()
+    collectVideos(data, videos)
+    return videos.entries.take(50).map { (id, info) -> FeedVideo(id, info.first, info.second) }
+}
+
+/**
+ * Scrapes a signed-in feed page with the WebView's cookies (shared with the login screen) and
+ * returns its videos. Desktop page because it embeds ytInitialData as a JSON literal.
+ */
+// ponytail: HTML scrape of ytInitialData, breaks if YouTube changes it; innertube /youtubei/v1/browse with
+// SAPISIDHASH auth is the sturdier upgrade.
+private fun fetchFeed(url: String): List<MediaBrowser.MediaItem> = parseFeed(fetchHtml(url)).map { v ->
+    MediaBrowser.MediaItem(
+        MediaDescription.Builder().setMediaId(v.id).setTitle(v.title).setSubtitle(v.channel)
+            .setIconUri(Uri.parse("content://$THUMBS_AUTHORITY/${v.id}")).build(),
+        MediaBrowser.MediaItem.FLAG_PLAYABLE
+    )
+}
+
+/** Desktop YouTube page [url], fetched with the signed-in WebView cookies. */
+private fun fetchHtml(url: String): String {
+    val conn = URL(url).openConnection().apply {
+        setRequestProperty("Cookie", CookieManager.getInstance().getCookie(url).orEmpty())
+        setRequestProperty("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36")
+        setRequestProperty("Accept-Language", java.util.Locale.getDefault().toLanguageTag() + ",en;q=0.8")
+        connectTimeout = 10_000
+        readTimeout = 15_000
+    }
+    return conn.getInputStream().bufferedReader().use { it.readText() }
+}
+
+/**
+ * SponsorBlock query for [videoId]. Only the first 4 hex digits of the id's SHA-256 leave the phone (the API's
+ * privacy mode); [parseSegments] picks this video out of the answer.
+ */
+internal fun sponsorUrl(videoId: String): String {
+    val hash = java.security.MessageDigest.getInstance("SHA-256").digest(videoId.toByteArray())
+        .joinToString("") { "%02x".format(it) }
+    return "https://sponsor.ajay.app/api/skipSegments/" + hash.take(4) +
+        "?categories=" + java.net.URLEncoder.encode("""["sponsor","selfpromo","interaction"]""", "UTF-8")
+}
+
+/** Skip segments (start to end, seconds) of [videoId] in a SponsorBlock hash-prefix answer. */
+internal fun parseSegments(json: String, videoId: String): List<Pair<Double, Double>> {
+    val all = JSONArray(json)
+    for (i in 0 until all.length()) {
+        val v = all.optJSONObject(i) ?: continue
+        if (v.optString("videoID") != videoId) continue
+        val segs = v.optJSONArray("segments") ?: return emptyList()
+        return (0 until segs.length()).mapNotNull { j ->
+            val s = segs.optJSONObject(j) ?: return@mapNotNull null
+            val r = s.optJSONArray("segment") ?: return@mapNotNull null
+            if (s.optString("actionType", "skip") != "skip" || r.length() < 2) return@mapNotNull null
+            (r.optDouble(0) to r.optDouble(1)).takeIf { it.second > it.first }
+        }
+    }
+    return emptyList()
+}
+
+/** Segment playing at [seconds], unless it ends within the next second (nothing left worth a jump). */
+internal fun segmentAt(segments: List<Pair<Double, Double>>, seconds: Int) =
+    segments.firstOrNull { seconds >= it.first && seconds < it.second - 1 }
+
+/** Artwork size capped at 320 px on the longest side, proportion kept; smaller art is left as is. */
+internal fun artSize(w: Int, h: Int): Pair<Int, Int> {
+    val scale = 320.0 / maxOf(w, h)
+    return if (scale >= 1) w to h else Math.round(w * scale).toInt() to Math.round(h * scale).toInt()
+}
+
+private const val THUMBS_AUTHORITY = "com.dave.tubeauto.thumbs"
+private val VIDEO_ID = Regex("[A-Za-z0-9_-]{11}")
+
+/** YouTube video id: exactly 11 of A-Z a-z 0-9 _ -. Guards the exported ThumbProvider against path tricks. */
+internal fun isVideoId(s: String) = VIDEO_ID.matches(s)
+
+// Video id of a watch, shorts or youtu.be link (absolute or path-only), else null.
+internal fun videoIdFromUrl(url: String): String? {
+    // First v= wins, as in the browser's URLSearchParams; only YouTube hosts (or a path on the current one).
+    val m = Regex("""^(?:https?://(?:[\w-]+\.)?youtube\.com)?/(?:watch\?(?:[^#]*?&)??v=|shorts/)([^&#?/]+)""").find(url)
+        ?: Regex("""^(?:https?://)?youtu\.be/([^?#/]+)""").find(url)
+        ?: return null
+    return m.groupValues[1].takeIf(::isVideoId)
+}
+
+// Video id of the first YouTube link in shared text (the YouTube app shares "Title https://youtu.be/<id>?si=…").
+internal fun sharedVideoId(text: String?): String? =
+    text?.let { t -> Regex("""https?://\S+""").findAll(t).firstNotNullOfOrNull { videoIdFromUrl(it.value) } }
+
+// Car's Tocar/Pausar: only with a video to control - a video page (playing or paused) or one playing elsewhere (miniplayer).
+internal fun playToggleShown(url: String, playing: Boolean) = playing || videoIdFromUrl(url) != null
+
+// Playback time on the phone bar: m:ss, or h:mm:ss from one hour on.
+internal fun clock(seconds: Long): String {
+    val s = seconds.coerceAtLeast(0)
+    return if (s >= 3600) "%d:%02d:%02d".format(s / 3600, s % 3600 / 60, s % 60) else "%d:%02d".format(s / 60, s % 60)
+}
+
+// Car video gestures. Points and rects (left, top, right, bottom) are in car surface pixels.
+
+// The host turns a double tap into onScale with factor 2 (a map zoom) and drops both taps: seconds to skip, 0 for none.
+internal fun doubleTapSkip(onWatch: Boolean, scale: Float, x: Float, y: Float, player: List<Float>?): Int {
+    if (!onWatch || scale != 2f || player == null) return 0
+    val (l, t, r, b) = player
+    if (x !in l..r || y !in t..b) return 0
+    return if (x < (l + r) / 2) -10 else 10
+}
+
+// Total the bubble shows: double taps on the same side within 1 s add up.
+internal fun addSkip(total: Int, at: Long, skip: Int, now: Long) =
+    if (total != 0 && (total > 0) == (skip > 0) && now - at <= 1000) total + skip else skip
+
+// Tap on YouTube's progress bar (null while its controls are hidden): where to seek, or null to pass the tap on.
+internal fun barTapMs(x: Float, y: Float, bar: List<Float>?, durationMs: Long): Long? {
+    if (bar == null || durationMs <= 0) return null
+    val (l, t, r, b) = bar
+    if (x !in l..r || y !in t..b) return null
+    return ((x - l) / (r - l) * durationMs).toLong()
+}
+
+// A drag seeks when it starts mostly sideways on a video with a known duration; otherwise it scrolls the page.
+internal fun dragSeeks(onWatch: Boolean, durationMs: Long, dx: Float, dy: Float) =
+    onWatch && durationMs > 0 && kotlin.math.abs(dx) > kotlin.math.abs(dy)
+
+// The player's width is the whole video; [fingerDx] is positive to the right.
+internal fun dragTargetMs(startMs: Long, fingerDx: Float, width: Float, durationMs: Long) =
+    (startMs + fingerDx / width * durationMs).toLong().coerceIn(0L, durationMs)
+
+// "target / duration" and the signed difference from where the drag started.
+internal fun dragLabel(targetMs: Long, durationMs: Long, startMs: Long): Pair<String, String> {
+    val diff = targetMs / 1000 - startMs / 1000
+    return "${clock(targetMs / 1000)} / ${clock(durationMs / 1000)}" to (if (diff < 0) "-" else "+") + clock(kotlin.math.abs(diff))
+}
+
+/**
+ * Serves content://…thumbs/<videoId> as the video's i.ytimg.com thumbnail: Android Auto only loads
+ * browse-list artwork from content:// URIs. Exported because the car host reads it; it only ever
+ * returns public YouTube thumbnails, and the id regex blocks path tricks.
+ */
+// ponytail: cache dir grows unbounded (~15 KB per video); Android clears cacheDir under storage pressure
+class ThumbProvider : ContentProvider() {
+    override fun onCreate() = true
+
+    override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
+        val id = uri.lastPathSegment?.takeIf(::isVideoId) ?: throw java.io.FileNotFoundException(uri.toString())
+        val file = File(context!!.cacheDir, "thumbs/$id.jpg")
+        if (!file.exists()) {
+            file.parentFile?.mkdirs()
+            // Write to a temp name first so a failed download never leaves a half file in the cache.
+            val tmp = File(file.path + ".tmp")
+            URL("https://i.ytimg.com/vi/$id/mqdefault.jpg").openStream().use { input -> tmp.outputStream().use(input::copyTo) }
+            tmp.renameTo(file)
+        }
+        return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+    }
+
+    override fun getType(uri: Uri) = "image/jpeg"
+    override fun query(uri: Uri, p: Array<String>?, s: String?, a: Array<String>?, o: String?) = null
+    override fun insert(uri: Uri, values: ContentValues?) = null
+    override fun delete(uri: Uri, s: String?, a: Array<String>?) = 0
+    override fun update(uri: Uri, v: ContentValues?, s: String?, a: Array<String>?) = 0
+}
+
+/** Title and subtitle (string ids) of the placeholder row shown when a feed has no videos. */
+internal fun feedNotice(signedIn: Boolean, failed: Boolean) = when {
+    !signedIn -> R.string.notice_signed_out to R.string.notice_signed_out_hint
+    failed -> R.string.notice_failed to R.string.notice_failed_hint
+    else -> R.string.notice_empty to R.string.notice_empty_hint
+}
+
+/**
+ * Makes the app a media source for Android Auto: the now-playing card shows the session's
+ * title/thumbnail, and the browse list offers history and subscriptions. Playback itself lives in
+ * the navigation screen's WebView, so picking a video there needs that screen open.
+ */
+class MediaService : MediaBrowserService() {
+    override fun onCreate() {
+        super.onCreate()
+        sessionToken = mediaSession(this).sessionToken
+    }
+
+    // The car binding the player (the media card, the only thing a wrong install shows in the car): spec install-check.
+    override fun onGetRoot(clientPackageName: String, clientUid: Int, rootHints: Bundle?): BrowserRoot {
+        if (notifyInstall(clientPackageName, installWarningNow())) notifyWrongInstall()
+        return BrowserRoot("root", null)
+    }
+
+    override fun onLoadChildren(parentId: String, result: Result<MutableList<MediaBrowser.MediaItem>>) {
+        fun folder(id: String, title: String) =
+            MediaBrowser.MediaItem(MediaDescription.Builder().setMediaId(id).setTitle(title).build(), MediaBrowser.MediaItem.FLAG_BROWSABLE)
+        if (parentId == "root") {
+            result.sendResult((FEEDS.map { (id, feed) -> folder(id, getString(feed.first)) } +
+                folder(PLAYLISTS, getString(R.string.playlists))).toMutableList())
+            return
+        }
+        val url = if (parentId == PLAYLISTS) "https://www.youtube.com/feed/playlists" else feedUrl(parentId)
+            ?: return result.sendResult(mutableListOf())
+        result.detach()
+        thread {
+            // SAPISID is the cookie Google sets on sign-in.
+            val signedIn = "SAPISID=" in CookieManager.getInstance().getCookie(url).orEmpty()
+            val fetched = runCatching {
+                if (parentId == PLAYLISTS) parsePlaylists(fetchHtml(url)).map { (id, title) -> folder(LIST_PREFIX + id, title) }
+                else fetchFeed(url)
+            }
+            val items = fetched.getOrDefault(emptyList()).ifEmpty {
+                val (title, subtitle) = feedNotice(signedIn, fetched.isFailure)
+                listOf(
+                    MediaBrowser.MediaItem(
+                        MediaDescription.Builder().setMediaId("empty").setTitle(getString(title)).setSubtitle(getString(subtitle)).build(),
+                        0
+                    )
+                )
+            }
+            mainExecutor.execute { result.sendResult(items.toMutableList()) }
+        }
+    }
+}
+
+/**
+ * Renders a WebView onto the car's navigation Surface through a VirtualDisplay + Presentation.
+ * The WebView outlives the surface (the display just loses its surface), so audio keeps going
+ * while another car app is on screen; everything is torn down only when the screen is destroyed.
+ */
+/**
+ * The car player: virtual display, Presentation and the YouTube WebView, plus everything around them (media session,
+ * gestures, overlays). Front ends: [YoutubeScreen] (Android Auto's navigation templates) and [LegacyCarActivity]
+ * (TubeAuto's full-screen projection mode, which keeps Google Maps in the cockpit).
+ */
+abstract class YoutubeEngine(val carContext: Context) {
+    // ---- What the front end provides ----
+    /** The buttons may have changed (play state, page kind, neighbors): rebuild them. */
+    protected abstract fun invalidate()
+    /** Whether the video is in front, no list or panel over it. */
+    protected abstract fun isTop(): Boolean
+    abstract fun toast(text: String, long: Boolean = false)
+    fun toast(res: Int, long: Boolean = false) = toast(carContext.getString(res), long)
+    /** Google's sign-in page was asked for: the car has no keyboard for it, point to the phone. */
+    protected abstract fun showSignIn()
+    // False once destroy() ran.
+    private var alive = true
+    // Forced audio-only (car button or phone remote), on top of the speed-based one.
+    var audioOnly = false
+        private set
+
+    private var display: VirtualDisplay? = null
+    private var displaySize: List<Int>? = null
+    private var presentation: Presentation? = null
+    private var webView: WebView? = null
+    private var root: FrameLayout? = null
+    // Host's visible area as left, top, right, bottom (see webViewBounds).
+    private var area: List<Int>? = null
+    // Uptime of the last template refresh asked to confirm a media card (see onVisibleAreaChanged).
+    private var confirmAt = 0L
+    // The WebView's client: loading screen and retries while offline (see OfflineRetry).
+    private var client: OfflineRetry? = null
+    // Set while a video is fullscreen; calling it exits fullscreen.
+    private var exitFullscreen: WebChromeClient.CustomViewCallback? = null
+    internal var playing = false
+    // End of the video (spec video-end): uptime since the page reports it ended (0 while not), and the autoplay state
+    // last seen in the page (null: never seen).
+    private var endedAt = 0L
+    // Whether YouTube's player has a previous and a next video (spec prev-next), as the page last reported.
+    internal var hasPrevious = false
+    internal var hasNext = false
+    // Video id the neighbors above belong to.
+    private var neighborsOf: String? = null
+    private var autonav: Boolean? = null
+    // Countdown panel back to the start page, and whether it is counting.
+    private var endView: View? = null
+    private var endText: android.widget.TextView? = null
+    private var endPanel: View? = null
+    private var endFill: View? = null
+    private var endCounting = false
+    private val goHome = Runnable {
+        stopEnd()
+        pageUrl = choice(carContext, HOME_PAGE)
+        webView?.loadUrl(pageUrl)
+    }
+    // Whether this car screen already showed the gesture hint (see takeGestureHint).
+    private var hintShown = false
+    // Whether the last template built had Tocar/Pausar: a page change that flips it rebuilds the template.
+    internal var toggleShown = false
+    private var positionMs = PlaybackState.PLAYBACK_POSITION_UNKNOWN
+    private var durationMs = 0L
+    private var rate = 1f
+    // elapsedRealtime of the PlaybackState last published (see setTime).
+    private var published = 0L
+    // Metadata last published, to add the duration once the page reports it.
+    private var meta: MediaMetadata? = null
+    // Title, channel and artwork URL of the metadata last published, to skip duplicate reports and stale downloads.
+    private var metaKey = ""
+    // Audio-only cover over the page while the car moves (flag "audioWhileMoving"), with the video's art and title.
+    private var cover: View? = null
+    private var coverArt: android.widget.ImageView? = null
+    private var coverTitle: android.widget.TextView? = null
+    // Double-tap bubble (see skipBubble): its pieces, and the total it shows since the first of a run of double taps.
+    private var skipView: FrameLayout? = null
+    private var skipMoon: View? = null
+    private var skipLabel: android.widget.LinearLayout? = null
+    private var skipIcon: android.widget.ImageView? = null
+    private var skipText: android.widget.TextView? = null
+    private var skipTotal = 0
+    // Drag on a video (see onScroll): the seek indicator, and the gesture in progress (null between gestures).
+    private var dragView: View? = null
+    private var dragTime: android.widget.TextView? = null
+    private var dragDiff: android.widget.TextView? = null
+    private var dragFill: View? = null
+    private var dragSeeking: Boolean? = null
+    private var dragId: String? = null
+    private var dragStartMs = 0L
+    private var dragFingerX = 0f
+    private var dragTargetMs = 0L
+    // The host never says the finger lifted: 300 ms without a scroll ends the gesture.
+    private val endDrag = Runnable {
+        if (dragSeeking == true && dragId == videoIdFromUrl(pageUrl)) js(jsSeekTo(dragTargetMs / 1000.0))
+        dragSeeking = null
+        dragView?.visibility = View.GONE
+    }
+    private var skipAt = 0L
+    private val ui = android.os.Handler(android.os.Looper.getMainLooper())
+    // Next turn of Waze / Maps (see NavListener), top start corner over everything; shownTurn is the maneuver text on screen.
+    private var navView: View? = null
+    private var navCard: View? = null
+    private var navIcon: android.widget.ImageView? = null
+    private var navBadge: android.widget.ImageView? = null
+    private var navDistance: android.widget.TextView? = null
+    private var navText: android.widget.TextView? = null
+    private var shownTurn: String? = null
+    private val navChanged = { showNav() }
+    // The phone switch changes while the car screen is up: apply it at once. Held here, prefs keep it weakly.
+    private val navPref = SharedPreferences.OnSharedPreferenceChangeListener { _, key -> if (key == "navOverlay") showNav() }
+    private val hideSkip = Runnable {
+        skipView?.animate()?.alpha(0f)?.setDuration(200)?.withEndAction { skipView?.visibility = View.GONE }
+    }
+    private var moving = false
+    private var lastFix: android.location.Location? = null
+    private val speedListener = android.location.LocationListener { l ->
+        // Fixes without a speed get one from the distance to the previous fix.
+        val prev = lastFix
+        lastFix = l
+        val dt = prev?.let { (l.elapsedRealtimeNanos - it.elapsedRealtimeNanos) / 1e9f } ?: 0f
+        val mps = if (l.hasSpeed()) l.speed else if (dt > 0) l.distanceTo(prev!!) / dt else return@LocationListener
+        val m = movingAfter(moving, mps)
+        if (m != moving) {
+            moving = m
+            updateCover()
+        }
+    }
+
+    // Steering-wheel / car media-card controls land here while this screen is alive.
+    private val session = mediaSession(carContext).apply {
+        setCallback(object : MediaSession.Callback() {
+            override fun onPlay() { js(JS_PLAY) }
+            override fun onPause() { js(JS_PAUSE) }
+            override fun onSkipToNext() { js(JS_NEXT) }
+            override fun onSkipToPrevious() { js(previousJs(hasPrevious)) } // same as the side strip's previous
+            override fun onSeekTo(pos: Long) { js(jsSeekTo(pos / 1000.0)) }
+            override fun onCustomAction(action: String, extras: Bundle?) {
+                when (action) {
+                    REWIND -> js(jsSeekBy(-10))
+                    FORWARD -> js(jsSeekBy(10))
+                    REMOTE_SEARCH -> extras?.getString("q")?.let { search(it) }
+                    REMOTE_HOME -> goHome()
+                    REMOTE_BACK -> back()
+                    REMOTE_AUDIO -> toast(if (toggleAudioOnly()) R.string.audio_only_on else R.string.audio_only_off)
+                    REMOTE_ASPECT -> toast(cycleAspect())
+                    REMOTE_OPEN -> extras?.getString("url")?.let { goTo(it) }
+                }
+            }
+            override fun onPlayFromMediaId(mediaId: String, extras: Bundle?) = open(watchUrl(mediaId))
+            override fun onPlayFromSearch(query: String?, extras: Bundle?) {
+                if (query.isNullOrBlank()) js(JS_PLAY) else searchToPlay(query, ::open)
+            }
+        })
+    }
+
+    init {
+        TubeLog.init(carContext)
+        TubeLog.d("Car player started (${javaClass.simpleName})")
+        carLink = this
+        pendingUrl?.let { pageUrl = it }
+        pendingUrl = null
+        // Continue where the last drive left off (flag "resumeLast"): the saved page and position.
+        if (pageUrl.isEmpty() && flag(carContext, "resumeLast")) restoreLastWatch(prefs(carContext))?.let { (url, at) ->
+            pageUrl = url
+            if (at != null) resumeAt = at
+        }
+        pageUrl = startUrl(prefs(carContext), pageUrl)
+        setPlaying(false)
+        listenSpeed()
+        RemoteNotice.show(carContext)
+    }
+
+    /** The front end is gone (car disconnected or app closed). */
+    open fun destroy() {
+        if (!alive) return
+        alive = false
+        TubeLog.d("Car player closed")
+        saveLastWatch(prefs(carContext), pageUrl, resumeAt)
+        stopSpeed()
+        teardown()
+        if (carLink === this) carLink = null
+        RemoteNotice.hide(carContext)
+        // Session is process-wide (MediaService holds its token): detach, don't release.
+        session.setCallback(idleCallback)
+        session.setPlaybackState(playbackState(false))
+    }
+
+    // ---- Actions shared by every front end and the phone remote ----
+    fun back() {
+        stopEnd() // leaving the video: no countdown landing over the page gone back to
+        exitFullscreen?.onCustomViewHidden() ?: webView?.goBack()
+    }
+
+    fun goTo(url: String) {
+        stopEnd()
+        pageUrl = url
+        webView?.loadUrl(url)
+    }
+
+    /** The configured start page, the same place the end-of-video countdown goes. */
+    fun goHome() = goTo(choice(carContext, HOME_PAGE))
+
+    fun search(query: String) {
+        val q = query.trim()
+        if (q.isEmpty()) return
+        val p = prefs(carContext)
+        p.edit().putString("recentSearches", addRecentSearch(recentSearches(p), q).joinToString("\n")).apply()
+        goTo(searchUrl(q))
+    }
+
+    fun togglePlay() = js(JS_TOGGLE)
+    fun seekBy(seconds: Int) = js(jsSeekBy(seconds))
+    fun next() = js(JS_NEXT)
+    fun previous() = js(previousJs(hasPrevious))
+
+    /** Next aspect, saved; returns its label. */
+    fun cycleAspect(): String = dev.begati.youtubeauto.cycleAspect(carContext).also { invalidate() }
+
+    /** Next text size (page zoom), saved; returns its label. */
+    fun cycleTextZoom(): String {
+        val keys = TEXT_ZOOM.options.keys.toList()
+        val next = keys[(keys.indexOf(choice(carContext, TEXT_ZOOM)) + 1) % keys.size]
+        setChoice(carContext, TEXT_ZOOM, next)
+        webView?.settings?.textZoom = next.toInt()
+        return carContext.getString(TEXT_ZOOM.options.getValue(next))
+    }
+
+    /** Audio only on or off by hand (whatever the speed); returns the new state. */
+    fun toggleAudioOnly(): Boolean {
+        audioOnly = !audioOnly
+        updateCover()
+        invalidate()
+        return audioOnly
+    }
+
+    /** A setting changed (car list, projection panel, phone): apply what the page doesn't read live. */
+    fun settingsChanged() {
+        webView?.settings?.textZoom = choice(carContext, TEXT_ZOOM).toInt()
+        applyPlayback()
+        listenSpeed() // the audio flag may have just been turned on
+        updateCover()
+        showNav() // on-screen navigation may have just been turned on or off
+        invalidate()
+    }
+
+    /** A real finger event on the car screen (projection mode), in surface pixels. */
+    fun touch(e: MotionEvent) {
+        val target = root ?: return
+        target.dispatchTouchEvent(e)
+    }
+
+    val hasPlayer get() = webView != null
+
+    // Speed for the audio-only cover, from the phone's GPS while the flag is on. Not the car's speed sensor: Android
+    // Auto only hands that to apps holding CAR_SPEED, which a sideloaded app can't get. Location access is asked on
+    // the phone (LoginActivity); without it the page just stays.
+    // ponytail: GPS runs while the car screen lives; fine in a car on a charger, add a lower-power source if battery shows up
+    private fun listenSpeed() {
+        if (!flag(carContext, "audioWhileMoving")) return stopSpeed()
+        if (carContext.checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) != android.content.pm.PackageManager.PERMISSION_GRANTED) return
+        runCatching {
+            carContext.getSystemService(android.location.LocationManager::class.java).requestLocationUpdates(
+                android.location.LocationManager.GPS_PROVIDER, 1000L, 0f, speedListener, android.os.Looper.getMainLooper(),
+            )
+        }
+    }
+
+    private fun stopSpeed() {
+        runCatching { carContext.getSystemService(android.location.LocationManager::class.java).removeUpdates(speedListener) }
+        moving = false
+        updateCover()
+    }
+
+    // Shows the cover while moving with the flag on; the video keeps playing under it.
+    private fun updateCover() {
+        val on = audioOnly || (moving && flag(carContext, "audioWhileMoving"))
+        cover?.visibility = if (on) View.VISIBLE else View.GONE
+        coverTitle?.text = meta?.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty()
+        val art = meta?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
+        // No artwork: a headphones icon in its place.
+        coverArt?.imageTintList = if (art != null) null else android.content.res.ColorStateList.valueOf(android.graphics.Color.WHITE)
+        if (art != null) coverArt?.setImageBitmap(art) else coverArt?.setImageResource(R.drawable.ic_headphones)
+        placeEnd() // the cover came or went during a countdown
+    }
+
+    // Opens [url] in the car; with no player yet it loads pageUrl when the car shows the screen.
+    private fun open(url: String) {
+        if (!alive) return waitForCar(url) // screen gone meanwhile
+        stopEnd()
+        pageUrl = url
+        val wv = webView
+        if (wv != null) wv.loadUrl(url) else sharedSession?.setPlaybackState(waitingForCar())
+    }
+
+    /** Reloads the car page (after the phone signs in, so it shows the account). */
+    fun reload() {
+        webView?.reload()
+    }
+
+    /** Re-applies the saved quality and speed to the current video (after the car settings or the phone change them). */
+    fun applyPlayback() {
+        js(JS_APPLY_QUALITY)
+        js(JS_APPLY_PLAYBACK)
+    }
+
+    internal fun js(code: String) {
+        webView?.evaluateJavascript(code, null)
+    }
+
+    private fun setPlaying(p: Boolean) {
+        // On screen: the surface is drawn, no audio cover over it, and no list (settings, search) pushed on top.
+        val visible = display?.surface != null && cover?.visibility != View.VISIBLE && isTop()
+        if (p) stopEnd() // playing again: no countdown back to the start page
+        if (p && takeGestureHint(prefs(carContext), onWatch, visible, hintShown)) {
+            hintShown = true
+            toast(R.string.gesture_hint, long = true)
+        }
+        playing = p
+        published = SystemClock.elapsedRealtime()
+        session.setPlaybackState(playbackState(p, positionMs, rate))
+        invalidate()
+        dropVideoIfGone()
+    }
+
+    private fun setNeighbors(prev: Boolean, next: Boolean) {
+        if (prev == hasPrevious && next == hasNext) return
+        hasPrevious = prev
+        hasNext = next
+        invalidate() // the side strip shows next only when there is one
+    }
+
+    private fun setEnded(e: Boolean, an: Int) {
+        autonav = if (an < 0) null else an == 1
+        endedAt = if (!e) 0L else endedAt.takeIf { it > 0 } ?: SystemClock.uptimeMillis()
+        val due = flag(carContext, "fullscreen") && endCountdownDue(e, autonav, SystemClock.uptimeMillis() - endedAt)
+        // Only while the video screen is in front and drawn: a countdown nobody sees must not change the page. The page
+        // keeps reporting the end, so it starts once the driver is back; leaving cancels a running one.
+        val seen = isTop() && display?.surface != null
+        if (!e || !seen) stopEnd() else if (due && !endCounting) startEnd()
+    }
+
+    // 5 s with the bar emptying, then the chosen start page (goHome); a tap goes at once (onClick).
+    private fun startEnd() {
+        val view = endView ?: return
+        endCounting = true
+        endText?.text = carContext.getString(R.string.going_home, carContext.getString(homeLabel(prefs(carContext))))
+        placeEnd()
+        endFill?.run {
+            animate().cancel()
+            // The track's fixed width: the panel may never have been laid out yet (GONE), so width can still be 0.
+            pivotX = if (layoutDirection == View.LAYOUT_DIRECTION_RTL) 240 * resources.displayMetrics.density else 0f
+            scaleX = 1f
+            animate().scaleX(0f).setDuration(5000).setInterpolator(android.view.animation.LinearInterpolator()).start()
+        }
+        view.alpha = 0f
+        view.visibility = View.VISIBLE
+        view.animate().alpha(1f).setDuration(200).start()
+        ui.removeCallbacks(goHome)
+        ui.postDelayed(goHome, 5000)
+    }
+
+    // The video plays again or the page left it: no countdown.
+    internal fun stopEnd() {
+        if (!endCounting) return
+        endCounting = false
+        ui.removeCallbacks(goHome)
+        endFill?.animate()?.cancel()
+        endView?.visibility = View.GONE
+        placeEnd() // the cover gets its art back
+    }
+
+    // Countdown over the audio-only cover: at the bottom, with the cover's art hidden so its title and line move up and
+    // stay clear of the panel even at 800x480; without the cover, centered. Re-run when the cover shows or hides.
+    private fun placeEnd() {
+        val overCover = endCounting && cover?.visibility == View.VISIBLE
+        coverArt?.visibility = if (overCover) View.GONE else View.VISIBLE
+        val panel = endPanel ?: return
+        panel.layoutParams = FrameLayout.LayoutParams(-2, -2,
+            if (overCover) android.view.Gravity.BOTTOM or android.view.Gravity.CENTER_HORIZONTAL else android.view.Gravity.CENTER).apply {
+            if (overCover) bottomMargin = (8 * panel.resources.displayMetrics.density).toInt()
+        }
+    }
+
+    // Off a video page with nothing playing (Início, search): no video is left in the car, so the phone bar and the
+    // media card stop showing the last one and its progress.
+    private fun dropVideoIfGone() {
+        if (metaKey.isEmpty() || playToggleShown(pageUrl, playing)) return
+        meta = null
+        metaKey = ""
+        durationMs = 0L
+        positionMs = PlaybackState.PLAYBACK_POSITION_UNKNOWN
+        session.setMetadata(null)
+        session.setPlaybackState(playbackState(false))
+        updateCover()
+    }
+
+    // Position and duration of the URL's video, from the page every 500 ms. No invalidate(): the template doesn't show them.
+    private fun setTime(id: String, seconds: Int, duration: Int, playbackRate: Float) {
+        resumeAt = id to seconds
+        if (seconds % 10 == 0) saveLastWatch(prefs(carContext), pageUrl, resumeAt)
+        skipSponsors(id, seconds)
+        // Readers extrapolate from the last published state, so republish only when that drifts (seek, rate change,
+        // stall), not every 500 ms.
+        val now = SystemClock.elapsedRealtime()
+        val expected = positionMs + if (playing) ((now - published) * rate).toLong() else 0L
+        positionMs = seconds * 1000L
+        if (playbackRate != rate || kotlin.math.abs(positionMs - expected) > 1500) {
+            rate = playbackRate
+            published = now
+            session.setPlaybackState(playbackState(playing, positionMs, rate))
+        } else {
+            positionMs = expected // keep the published baseline
+        }
+        val ms = duration * 1000L
+        if (ms > 0 && ms != durationMs) {
+            durationMs = ms
+            meta?.let { session.setMetadata(MediaMetadata.Builder(it).putLong(MediaMetadata.METADATA_KEY_DURATION, ms).build()) }
+        }
+    }
+
+    // SponsorBlock segments of video sbId, and those already jumped (a seek back into one plays it).
+    private var sbId = ""
+    private var sbSegments: List<Pair<Double, Double>> = emptyList()
+    private val sbSkipped = mutableSetOf<Pair<Double, Double>>()
+
+    // Fetches a new video's segments once, then jumps each one as playback enters it.
+    private fun skipSponsors(id: String, seconds: Int) {
+        if (!flag(carContext, "sponsorBlock")) return
+        if (id != sbId) {
+            sbId = id
+            sbSegments = emptyList()
+            sbSkipped.clear()
+            thread {
+                // 404 means no segments for that prefix: the same empty list as a failure.
+                val segs = runCatching {
+                    parseSegments(URL(sponsorUrl(id)).openStream().bufferedReader().use { it.readText() }, id)
+                }.getOrDefault(emptyList())
+                carContext.mainExecutor.execute { if (sbId == id) sbSegments = segs }
+            }
+            return
+        }
+        val seg = segmentAt(sbSegments, seconds) ?: return
+        if (!sbSkipped.add(seg)) return
+        js(jsSeekTo(seg.second))
+        toast(R.string.sponsor_skipped)
+    }
+
+    private fun setMeta(title: String, artist: String, art: String) {
+        val key = "$title|$artist|$art"
+        if (key == metaKey) return
+        metaKey = key
+        durationMs = 0L // the next time report brings the new video's duration
+        fun publish(bmp: Bitmap?) {
+            if (metaKey != key || !alive) return
+            meta = MediaMetadata.Builder()
+                .putString(MediaMetadata.METADATA_KEY_TITLE, title)
+                .putString(MediaMetadata.METADATA_KEY_ARTIST, artist)
+                .apply { bmp?.let { putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, it) } }
+                .apply { if (durationMs > 0) putLong(MediaMetadata.METADATA_KEY_DURATION, durationMs) }
+                .build()
+            session.setMetadata(meta)
+            updateCover()
+        }
+        publish(null)
+        if (!art.startsWith("https://")) return
+        thread {
+            val bmp = runCatching {
+                val full = URL(art).openStream().use(BitmapFactory::decodeStream)
+                // Metadata crosses Binder (~1 MB limit), so cap the artwork size.
+                val (w, h) = artSize(full.width, full.height)
+                if (w != full.width || h != full.height) Bitmap.createScaledBitmap(full, w, h, true) else full
+            }.getOrNull()
+            carContext.mainExecutor.execute { publish(bmp) }
+        }
+    }
+
+    // Whether the side strip last built was a video's (with previous/next): a page change that flips it rebuilds.
+    internal var stripWatch = false
+
+    fun surfaceAvailable(surface: android.view.Surface, width: Int, height: Int, dpi: Int) {
+        val size = listOf(width, height, dpi)
+        // Same size: reattach to the live display, page and playback untouched.
+        // Different size: Presentation dismisses itself on metric changes, so rebuild (reloads pageUrl).
+        if (display != null && size == displaySize) {
+            display?.surface = surface
+            return
+        }
+        teardown()
+        TubeLog.d("Car surface ${width}x$height @$dpi dpi")
+        val dm = carContext.getSystemService(DisplayManager::class.java)
+        val vd = dm.createVirtualDisplay("youtube", width, height, dpi, surface, 0)
+        display = vd
+        displaySize = size
+        // Explicit dark theme without an action bar (AppTheme has one, a black band over the page): the WebView asks
+        // YouTube for dark mode whatever the phone or the car day/night mode is.
+        presentation = Presentation(carContext, vd.display, android.R.style.Theme_DeviceDefault_NoActionBar).apply {
+            val frame = FrameLayout(context)
+            val offline = offlineView(context, car = true)
+            val wv = WebView(context).apply {
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.mediaPlaybackRequiresUserGesture = false
+                // Bigger text and tap targets for a touchscreen at arm's length.
+                settings.textZoom = choice(carContext, TEXT_ZOOM).toInt()
+                addJavascriptInterface(object {
+                    @JavascriptInterface
+                    fun playing(p: Boolean) = carContext.mainExecutor.execute { setPlaying(p) }
+
+                    @JavascriptInterface
+                    fun quality() = effectiveQuality(carContext)
+
+                    @JavascriptInterface
+                    fun speed() = choice(carContext, SPEED)
+
+                    @JavascriptInterface
+                    fun saveQuality(q: String) = setChoice(carContext, QUALITY, q)
+
+                    @JavascriptInterface
+                    fun saveSpeed(r: String) = setChoice(carContext, SPEED, r)
+
+                    @JavascriptInterface
+                    fun time(id: String, t: Int, dur: Int, rate: Float) = carContext.mainExecutor.execute { setTime(id, t, dur, rate) }
+
+                    @JavascriptInterface
+                    fun flag(key: String) = flag(carContext, key)
+
+                    @JavascriptInterface
+                    fun aspect() = choice(carContext, ASPECT)
+
+                    @JavascriptInterface
+                    fun neighbors(prev: Boolean, next: Boolean) = carContext.mainExecutor.execute { setNeighbors(prev, next) }
+
+                    @JavascriptInterface
+                    fun ended(e: Boolean, autonav: Int) = carContext.mainExecutor.execute { setEnded(e, autonav) }
+
+                    @JavascriptInterface
+                    fun meta(title: String, artist: String, art: String) =
+                        carContext.mainExecutor.execute { setMeta(title, artist, art) }
+                }, "yta")
+                webViewClient = object : OfflineRetry(carContext, offline) {
+                    override fun onLoaded(view: WebView) {
+                        view.evaluateJavascript(PAGE_JS, null)
+                    }
+
+                    // The car has no keyboard for Google's sign-in form: keep the page, point to the phone.
+                    override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                        if (!request.isForMainFrame || !isCarSignIn(request.url.toString())) return false
+                        showSignIn()
+                        return true
+                    }
+
+                    override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
+                        url ?: return
+                        pageUrl = url
+                        // Another video: the last one's previous/next no longer apply until the page reports this one's.
+                        if (videoIdFromUrl(url) != neighborsOf) {
+                            neighborsOf = videoIdFromUrl(url)
+                            setNeighbors(false, false)
+                        }
+                        if (playToggleShown(url, playing) != toggleShown || (videoIdFromUrl(url) != null) != stripWatch) invalidate()
+                        dropVideoIfGone()
+                        saveLastWatch(prefs(carContext), url, resumeAt)
+                    }
+
+                    override fun onRenderProcessGone(view: WebView, detail: android.webkit.RenderProcessGoneDetail): Boolean {
+                        // The page's process died (low memory): rebuild on the same surface instead of taking the app down.
+                        TubeLog.d("WebView renderer gone (crash=${detail.didCrash()}); rebuilding")
+                        val d = display
+                        val sz = displaySize
+                        val sf = d?.surface
+                        teardown()
+                        if (sf != null && sz != null) ui.post { surfaceAvailable(sf, sz[0], sz[1], sz[2]) }
+                        return true
+                    }
+                }
+                client = webViewClient as OfflineRetry // the object above
+                webChromeClient = object : WebChromeClient() {
+                    private var custom: View? = null
+
+                    override fun onShowCustomView(view: View, callback: CustomViewCallback) {
+                        custom = view
+                        exitFullscreen = callback
+                        frame.addView(view, 1) // over the page, under the offline screen and the audio cover
+                        fitToArea() // the native fullscreen video also stops at a media card
+                    }
+
+                    override fun onHideCustomView() {
+                        custom?.let(frame::removeView)
+                        custom = null
+                        exitFullscreen = null
+                    }
+                }
+                // Ads are stripped from the player responses before the page reads them (assets/page_start.js); a
+                // WebView without document-start scripts keeps only the skip in PAGE_JS.
+                if (flag(carContext, "skipAds") && WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                    val start = carContext.assets.open("page_start.js").bufferedReader().use { it.readText() }
+                    WebViewCompat.addDocumentStartJavaScript(this, start, setOf("https://m.youtube.com"))
+                }
+                loadUrl(withResume(pageUrl, resumeAt))
+            }
+            webView = wv
+            root = frame
+            frame.addView(wv)
+            // Gesture feedback: over the page, under the offline screen and the audio cover.
+            frame.addView(skipBubble(context).also { skipView = it })
+            frame.addView(dragIndicator(context).also { dragView = it })
+            frame.addView(offline)
+            frame.addView(audioCover(context).also { cover = it })
+            frame.addView(navOverlay(context).also { navView = it }) // over the audio cover too: driving is when it matters
+            frame.addView(endIndicator(context).also { endView = it }) // over the audio cover too: same dead end under it
+            onNavChanged = navChanged
+            prefs(carContext).registerOnSharedPreferenceChangeListener(navPref)
+            showNav()
+            updateCover()
+            fitToArea()
+            setContentView(frame)
+            show()
+        }
+    }
+
+    // Keep the display, WebView and playback alive; only drop the surface we can no longer draw on.
+    fun surfaceDestroyed() {
+        display?.surface = null
+        stopEnd() // unseen: it starts again from the next ended report once the screen is back
+        if (!flag(carContext, "background")) js(JS_PAUSE)
+    }
+
+    private fun teardown() {
+        client?.release()
+        client = null
+        webView?.destroy()
+        presentation?.dismiss()
+        display?.release()
+        webView = null
+        root = null
+        cover = null
+        coverArt = null
+        coverTitle = null
+        ui.removeCallbacks(hideSkip)
+        ui.removeCallbacks(endDrag)
+        dragSeeking = null
+        dragView = null
+        ui.removeCallbacks(goHome)
+        endCounting = false
+        endView = null
+        endText = null
+        endPanel = null
+        endFill = null
+        dragTime = null
+        dragDiff = null
+        dragFill = null
+        if (onNavChanged === navChanged) onNavChanged = null
+        prefs(carContext).unregisterOnSharedPreferenceChangeListener(navPref)
+        navView = null
+        navCard = null
+        navIcon = null
+        navBadge = null
+        navDistance = null
+        navText = null
+        shownTurn = null
+        skipView = null
+        skipMoon = null
+        skipLabel = null
+        skipIcon = null
+        skipText = null
+        exitFullscreen = null
+        presentation = null
+        display = null
+        displaySize = null
+    }
+
+    // Visible area: it shrinks while the action strips show and when a media card sits beside the app.
+    // Going back full screen from the split view, the host sends the full area and then repeats the split one,
+    // correcting it only when the strips next hide (~10 s). So an area with a card is confirmed once by a template
+    // refresh, which makes the host resend the real area; the 2 s window keeps a real card from looping.
+    // ponytail: host quirk seen on the DHU; drop the refresh if the host starts sending the right area on its own
+    fun visibleAreaChanged(visibleArea: android.graphics.Rect) {
+        area = visibleArea.run { listOf(left, top, right, bottom) }
+        val (w, h) = displaySize ?: return
+        fitToArea()
+        val now = SystemClock.uptimeMillis()
+        if (webViewBounds(w, h, area) != listOf(0, 0, w, h) && now - confirmAt > 2000) {
+            confirmAt = now
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                if (alive) invalidate()
+            }, 500)
+        }
+    }
+
+    // Sizes every child of the frame: the WebView and, while shown, the native fullscreen video.
+    private fun fitToArea() {
+        val frame = root ?: return
+        val (w, h) = displaySize ?: return
+        val (l, t, r, b) = webViewBounds(w, h, area)
+        for (i in 0 until frame.childCount) {
+            frame.getChildAt(i).layoutParams = FrameLayout.LayoutParams(r - l, b - t).apply {
+                leftMargin = l
+                topMargin = t
+            }
+        }
+    }
+
+    // Half-moon on the tapped side with an arrow and the seconds skipped, like YouTube's own double-tap feedback.
+    // Sized per show from the WebView's area (see showSkip); never takes touches.
+    private fun skipBubble(ctx: Context) = FrameLayout(ctx).apply {
+        fun dp(n: Int) = (n * ctx.resources.displayMetrics.density).toInt()
+        visibility = View.GONE
+        addView(View(ctx).also { skipMoon = it }.apply {
+            background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.OVAL
+                setColor(0x80000000.toInt())
+            }
+        })
+        addView(android.widget.LinearLayout(ctx).also { skipLabel = it }.apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            gravity = android.view.Gravity.CENTER
+            addView(android.widget.ImageView(ctx).also { skipIcon = it }.apply {
+                imageTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.WHITE)
+            }, android.widget.LinearLayout.LayoutParams(dp(56), dp(56)))
+            addView(android.widget.TextView(ctx).also { skipText = it }.apply {
+                setTextColor(android.graphics.Color.WHITE)
+                textSize = 20f
+                typeface = android.graphics.Typeface.DEFAULT_BOLD
+                setShadowLayer(4f, 0f, 1f, 0x80000000.toInt())
+                setPadding(0, dp(4), 0, 0)
+            }, android.widget.LinearLayout.LayoutParams(-2, -2))
+        })
+    }
+
+    private fun showSkip(skip: Int) {
+        val view = skipView ?: return
+        val (w, h) = displaySize ?: return
+        val (l, t, r, b) = webViewBounds(w, h, area)
+        val now = SystemClock.uptimeMillis()
+        val added = skipTotal != 0 && addSkip(skipTotal, skipAt, skip, now) != skip
+        skipTotal = addSkip(skipTotal, skipAt, skip, now)
+        skipAt = now
+        // Physical side, also in right-to-left languages: it is where the finger was.
+        val side = if (skipTotal < 0) android.view.Gravity.LEFT else android.view.Gravity.RIGHT
+        val aw = r - l
+        val ah = b - t
+        val out = (aw * 0.12f).toInt() // part of the moon off the edge, so its curve faces the middle
+        skipMoon?.layoutParams = FrameLayout.LayoutParams((aw * 0.42f).toInt(), (ah * 1.6f).toInt(), side or android.view.Gravity.CENTER_VERTICAL).apply {
+            if (side == android.view.Gravity.LEFT) leftMargin = -out else rightMargin = -out
+        }
+        // The host's strips sit on the page's edge while shown (the visible area shrinks by them): the label keeps clear.
+        val strip = area?.let { if (side == android.view.Gravity.LEFT) it[0] - l else r - it[2] }?.coerceIn(0, aw / 4) ?: 0
+        skipLabel?.layoutParams = FrameLayout.LayoutParams((aw * 0.42f).toInt() - out - strip, -2, side or android.view.Gravity.CENTER_VERTICAL).apply {
+            if (side == android.view.Gravity.LEFT) leftMargin = strip else rightMargin = strip
+        }
+        skipIcon?.setImageResource(if (skipTotal < 0) R.drawable.ic_rewind else R.drawable.ic_fast_forward)
+        skipText?.text = carContext.getString(R.string.seek_seconds, kotlin.math.abs(skipTotal))
+        ui.removeCallbacks(hideSkip)
+        view.animate().cancel()
+        if (view.visibility != View.VISIBLE) {
+            view.alpha = 0f
+            view.visibility = View.VISIBLE
+        }
+        view.animate().alpha(1f).setDuration(120).setInterpolator(android.view.animation.DecelerateInterpolator()).start()
+        // Each added 10 s nudges the count, so the change reads at a glance.
+        if (added) skipLabel?.run {
+            scaleX = 1.15f
+            scaleY = 1.15f
+            animate().scaleX(1f).scaleY(1f).setDuration(160).setInterpolator(android.view.animation.DecelerateInterpolator()).start()
+        }
+        ui.postDelayed(hideSkip, 600)
+    }
+
+    // Player and progress bar in surface px, the main video's duration and time; read from the page when a gesture lands.
+    private class Geometry(val player: List<Float>?, val bar: List<Float>?, val durationMs: Long, val positionMs: Long)
+
+    private fun geometry(then: (Geometry) -> Unit) {
+        val wv = webView ?: return
+        val (w, h) = displaySize ?: return
+        val (l, t) = webViewBounds(w, h, area)
+        val d = wv.resources.displayMetrics.density
+        wv.evaluateJavascript(JS_GEOMETRY) { json ->
+            // Unreadable page: no player, no bar, no duration, so the gesture falls back to what it did before.
+            val o = runCatching { JSONObject(json) }.getOrNull() ?: JSONObject()
+            fun rect(k: String) = o.optJSONArray(k)?.let { a -> List(4) { (a.getDouble(it) * d).toFloat() + if (it % 2 == 0) l else t } }
+            then(Geometry(rect("p"), rect("b"), (o.optDouble("d", 0.0) * 1000).toLong(), (o.optDouble("t", 0.0) * 1000).toLong()))
+        }
+    }
+
+    internal val onWatch get() = videoIdFromUrl(pageUrl) != null
+
+    // Double tap (the host's onScale with factor 2): 10 s back on the player's left half, forward on its right half.
+    fun onScale(focusX: Float, focusY: Float, scaleFactor: Float) {
+        if (scaleFactor != 2f || !onWatch) return // a pinch, or no video: nothing to read
+        geometry { g ->
+            val skip = doubleTapSkip(onWatch, scaleFactor, focusX, focusY, g.player)
+            if (skip == 0) return@geometry
+            js(jsSeekBy(skip))
+            showSkip(skip)
+        }
+    }
+
+    // Black screen with the video's art, title and "Audio only while driving"; swallows taps.
+    // Sizes in dp of [ctx]'s display: the car's virtual display.
+    private fun audioCover(ctx: Context): View = FrameLayout(ctx).apply {
+        fun dp(n: Int) = (n * ctx.resources.displayMetrics.density).toInt()
+        setBackgroundColor(android.graphics.Color.BLACK)
+        visibility = View.GONE
+        isClickable = true
+        addView(
+            android.widget.LinearLayout(ctx).apply {
+                orientation = android.widget.LinearLayout.VERTICAL
+                gravity = android.view.Gravity.CENTER_HORIZONTAL
+                setPadding(dp(32), 0, dp(32), 0)
+                addView(android.widget.ImageView(ctx).also { coverArt = it }, android.widget.LinearLayout.LayoutParams(dp(320), dp(180)))
+                addView(android.widget.TextView(ctx).also { coverTitle = it }.apply {
+                    setTextColor(android.graphics.Color.WHITE)
+                    textSize = 24f
+                    maxLines = 2
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                    gravity = android.view.Gravity.CENTER
+                    setPadding(0, dp(24), 0, dp(8))
+                })
+                addView(android.widget.TextView(ctx).apply {
+                    setText(R.string.audio_only_moving)
+                    setTextColor(0xB3FFFFFF.toInt())
+                    textSize = 20f
+                    gravity = android.view.Gravity.CENTER
+                })
+            },
+            FrameLayout.LayoutParams(-1, -2, android.view.Gravity.CENTER),
+        )
+    }
+
+    // Next-turn card, same family as the drag panel: maneuver icon, distance big, maneuver text below. Never takes touches.
+    private fun navOverlay(ctx: Context) = FrameLayout(ctx).apply {
+        fun dp(n: Int) = (n * ctx.resources.displayMetrics.density).toInt()
+        visibility = View.GONE
+        addView(android.widget.LinearLayout(ctx).also { navCard = it }.apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(12), dp(20), dp(14))
+            // More opaque than the drag panel: it stays up over bright video for the whole drive.
+            background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = dp(16).toFloat()
+                setColor(0xE0000000.toInt())
+            }
+            elevation = dp(4).toFloat()
+            addView(FrameLayout(ctx).apply {
+                addView(android.widget.ImageView(ctx).also { navIcon = it }, FrameLayout.LayoutParams(dp(72), dp(72)))
+                // Source badge: 26 dp app icon in a 2 dp ring of the card's color, so it reads apart from the arrow.
+                addView(android.widget.ImageView(ctx).also { navBadge = it }.apply {
+                    visibility = View.GONE
+                    setPadding(dp(2), dp(2), dp(2), dp(2))
+                    background = android.graphics.drawable.GradientDrawable().apply {
+                        shape = android.graphics.drawable.GradientDrawable.OVAL
+                        setColor(0xFF000000.toInt())
+                    }
+                }, FrameLayout.LayoutParams(dp(30), dp(30), android.view.Gravity.BOTTOM or android.view.Gravity.END))
+                // Inside the icon's box: the card clips anything past it (a negative margin cut the badge).
+            }, android.widget.LinearLayout.LayoutParams(dp(72), dp(72)).apply {
+                marginEnd = dp(14)
+            })
+            addView(android.widget.LinearLayout(ctx).apply {
+                orientation = android.widget.LinearLayout.VERTICAL
+                addView(android.widget.TextView(ctx).also { navDistance = it }.apply {
+                    setTextColor(android.graphics.Color.WHITE)
+                    textSize = 32f
+                    typeface = android.graphics.Typeface.DEFAULT_BOLD
+                    fontFeatureSettings = "tnum" // the distance counts down without the card twitching
+                    includeFontPadding = false
+                    maxLines = 1
+                })
+                addView(android.widget.TextView(ctx).also { navText = it }.apply {
+                    setTextColor(0xDEFFFFFF.toInt())
+                    textSize = 20f
+                    maxLines = 2
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                    maxWidth = dp(290) // two lines of 20 sp at the width 18 sp had
+                    setPadding(0, dp(2), 0, 0)
+                })
+            }, android.widget.LinearLayout.LayoutParams(-2, -2))
+        // Start corner: top right in right-to-left languages, where reading begins.
+        }, FrameLayout.LayoutParams(-2, -2, android.view.Gravity.TOP or android.view.Gravity.START).apply {
+            marginStart = dp(12)
+            topMargin = dp(12)
+        })
+    }
+
+    // Shows, updates or hides the card from navFeed. Only a new maneuver animates; the distance ticking down does not.
+    private fun showNav() {
+        val view = navView ?: return
+        val turn = navToShow(prefs(carContext), navFeed)
+        if (turn == null) {
+            if (view.visibility == View.VISIBLE) view.animate().alpha(0f).setDuration(150).withEndAction { view.visibility = View.GONE }.start()
+            shownTurn = null
+            return
+        }
+        navDistance?.text = turn.distance
+        navDistance?.visibility = if (turn.distance.isEmpty()) View.GONE else View.VISIBLE
+        navText?.text = turn.maneuver
+        navText?.visibility = if (turn.maneuver.isEmpty()) View.GONE else View.VISIBLE
+        val icon = turn.icon
+        // Maps' arrow is a one-color glyph tinted black (seen on the phone): white, like the app's own icons.
+        navIcon?.imageTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.WHITE)
+        if (icon != null) navIcon?.setImageIcon(icon) else navIcon?.setImageResource(maneuverIcon(maneuverOf(turn.maneuver)))
+        // Who sends the route: the app's own launcher icon, small, on the maneuver icon's corner.
+        val badge = runCatching { carContext.packageManager.getApplicationIcon(turn.app) }.getOrNull()
+        navBadge?.setImageDrawable(badge)
+        navBadge?.visibility = if (badge == null) View.GONE else View.VISIBLE
+        val ease = android.view.animation.DecelerateInterpolator(2f)
+        if (view.visibility == View.VISIBLE) {
+            view.animate().cancel() // a hide still fading out (a quick remove + post) would end GONE
+            view.alpha = 1f
+        }
+        if (view.visibility != View.VISIBLE) {
+            view.animate().cancel()
+            view.alpha = 0f
+            view.visibility = View.VISIBLE
+            navCard?.translationY = -navCard!!.resources.displayMetrics.density * 8
+            view.animate().alpha(1f).setDuration(200).setInterpolator(ease).start()
+            navCard?.animate()?.translationY(0f)?.setDuration(240)?.setInterpolator(ease)?.start()
+        } else if (turn.maneuver != shownTurn) navCard?.run {
+            scaleX = 0.96f
+            scaleY = 0.96f
+            pivotX = if (layoutDirection == View.LAYOUT_DIRECTION_RTL) width.toFloat() else 0f // grows from its corner
+            pivotY = 0f
+            animate().scaleX(1f).scaleY(1f).setDuration(220).setInterpolator(ease).start()
+        }
+        shownTurn = turn.maneuver
+    }
+
+    // Centered panel at the end of a video (spec video-end): "Voltando para Início" and a bar emptying in 5 s; same
+    // family as the drag panel. Never takes touches: a tap reaches onClick, which goes at once.
+    private fun endIndicator(ctx: Context) = FrameLayout(ctx).apply {
+        fun dp(n: Int) = (n * ctx.resources.displayMetrics.density).toInt()
+        visibility = View.GONE
+        addView(android.widget.LinearLayout(ctx).also { endPanel = it }.apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            gravity = android.view.Gravity.CENTER_HORIZONTAL
+            setPadding(dp(28), dp(18), dp(28), dp(22))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = dp(PANEL_CORNER_DP).toFloat()
+                setColor(0xCC000000.toInt())
+            }
+            addView(android.widget.TextView(ctx).also { endText = it }.apply {
+                setTextColor(android.graphics.Color.WHITE)
+                textSize = 24f
+                typeface = android.graphics.Typeface.DEFAULT_BOLD
+            }, android.widget.LinearLayout.LayoutParams(-2, -2))
+            // What the tap does (onClick goes at once): otherwise nothing on screen says it.
+            addView(android.widget.TextView(ctx).apply {
+                setText(R.string.going_home_tap)
+                setTextColor(0xB3FFFFFF.toInt())
+                textSize = 20f
+                setPadding(0, dp(2), 0, dp(14))
+            }, android.widget.LinearLayout.LayoutParams(-2, -2))
+            addView(FrameLayout(ctx).apply {
+                setBackgroundColor(0x4DFFFFFF)
+                addView(View(ctx).also { endFill = it }.apply { setBackgroundColor(android.graphics.Color.WHITE) }, FrameLayout.LayoutParams(-1, -1))
+            }, android.widget.LinearLayout.LayoutParams(dp(240), dp(PANEL_BAR_DP)))
+        }, FrameLayout.LayoutParams(-2, -2, android.view.Gravity.CENTER))
+    }
+
+    // Centered panel while a drag seeks: target / duration, the signed jump and a track at the target.
+    private fun dragIndicator(ctx: Context) = FrameLayout(ctx).apply {
+        fun dp(n: Int) = (n * ctx.resources.displayMetrics.density).toInt()
+        visibility = View.GONE
+        addView(android.widget.LinearLayout(ctx).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            gravity = android.view.Gravity.CENTER_HORIZONTAL
+            setPadding(dp(28), dp(16), dp(28), dp(20))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = dp(PANEL_CORNER_DP).toFloat()
+                setColor(0xCC000000.toInt())
+            }
+            addView(android.widget.TextView(ctx).also { dragTime = it }.apply {
+                setTextColor(android.graphics.Color.WHITE)
+                textSize = 28f
+                typeface = android.graphics.Typeface.DEFAULT_BOLD
+                fontFeatureSettings = "tnum" // digits keep their width while they change
+            }, android.widget.LinearLayout.LayoutParams(-2, -2))
+            addView(android.widget.TextView(ctx).also { dragDiff = it }.apply {
+                setTextColor(0xB3FFFFFF.toInt())
+                textSize = 20f
+                fontFeatureSettings = "tnum"
+                setPadding(0, dp(2), 0, dp(12))
+            }, android.widget.LinearLayout.LayoutParams(-2, -2))
+            addView(FrameLayout(ctx).apply {
+                setBackgroundColor(0x4DFFFFFF)
+                addView(View(ctx).also { dragFill = it }.apply { setBackgroundColor(android.graphics.Color.WHITE) }, FrameLayout.LayoutParams(0, -1))
+            }, android.widget.LinearLayout.LayoutParams(dp(240), dp(PANEL_BAR_DP)))
+        }, FrameLayout.LayoutParams(-2, -2, android.view.Gravity.CENTER))
+    }
+
+    // A drag on a video that starts sideways seeks, the WebView's width being the whole video; any other drag scrolls
+    // the page. The seek happens once, when the drag ends (endDrag), not on every scroll.
+    fun onScroll(distanceX: Float, distanceY: Float) {
+        ui.removeCallbacks(endDrag)
+        ui.postDelayed(endDrag, 300)
+        // distanceX is how far the content would scroll: positive when the finger moves left.
+        if (dragSeeking == null) {
+            dragSeeking = dragSeeks(onWatch, durationMs, -distanceX, distanceY)
+            dragId = videoIdFromUrl(pageUrl)
+            dragStartMs = positionMs.coerceAtLeast(0)
+            dragFingerX = 0f
+            // positionMs lags up to 500 ms: start from the page's own time as soon as it answers.
+            if (dragSeeking == true) geometry { g -> if (dragSeeking == true && g.durationMs > 0) { dragStartMs = g.positionMs; showDrag() } }
+        }
+        if (dragSeeking != true) {
+            webView?.scrollBy(distanceX.toInt(), distanceY.toInt())
+            return
+        }
+        dragFingerX -= distanceX
+        showDrag()
+    }
+
+    private fun showDrag() {
+        val (w, h) = displaySize ?: return
+        val (l, _, r) = webViewBounds(w, h, area)
+        dragTargetMs = dragTargetMs(dragStartMs, dragFingerX, (r - l).toFloat(), durationMs)
+        val (time, diff) = dragLabel(dragTargetMs, durationMs, dragStartMs)
+        dragTime?.text = time
+        dragDiff?.text = diff
+        val track = (dragFill?.parent as? View)?.width ?: 0
+        dragFill?.layoutParams = dragFill?.layoutParams?.apply { width = (track * dragTargetMs / durationMs).toInt() }
+        dragView?.visibility = View.VISIBLE
+    }
+
+    // Called only on hosts with Car API level >= 5. On a video, a tap on YouTube's visible progress bar seeks there
+    // (the player ignores a tap with no movement); any other tap goes to the page.
+    fun onClick(x: Float, y: Float) {
+        if (endCounting) return goHome.run() // the countdown's tap: go now
+        if (!onWatch) return tap(x, y)
+        geometry { g ->
+            val ms = barTapMs(x, y, g.bar, g.durationMs)
+            if (ms == null) tap(x, y) else js(jsSeekTo(ms / 1000.0))
+        }
+    }
+
+    private fun tap(x: Float, y: Float) {
+        val target = root ?: return
+        val t = SystemClock.uptimeMillis()
+        for (action in intArrayOf(MotionEvent.ACTION_DOWN, MotionEvent.ACTION_UP)) {
+            val e = MotionEvent.obtain(t, t, action, x, y, 0)
+            target.dispatchTouchEvent(e)
+            e.recycle()
+        }
+    }
+}
+
+// No network (DNS, connection, timeout, I/O; UNKNOWN covers ERR_INTERNET_DISCONNECTED on some WebView builds).
+// Anything else (an intent:// or app link, a bad URL, SSL) is not cured by retrying, so it keeps the WebView's page.
+/** Google's sign-in host: its forms need a keyboard, which the car's virtual display doesn't have. */
+internal fun isCarSignIn(url: String?) =
+    runCatching { java.net.URL(url).host.equals("accounts.google.com", ignoreCase = true) }.getOrDefault(false)
+
+internal fun isNetworkError(code: Int) = code in setOf(
+    WebViewClient.ERROR_HOST_LOOKUP, WebViewClient.ERROR_CONNECT, WebViewClient.ERROR_TIMEOUT,
+    WebViewClient.ERROR_IO, WebViewClient.ERROR_UNKNOWN,
+)
+
+/**
+ * WebViewClient that covers the page with [overlay] while its main frame can't load (no network), and reloads it
+ * every 5 s and as soon as a network with internet comes up, until it loads. Call [release] when the WebView goes.
+ * Shared by the car screen and the phone's login screen.
+ */
+internal open class OfflineRetry(ctx: Context, private val overlay: View) : WebViewClient() {
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var web: WebView? = null
+    // Set when the main frame fails, cleared when a new load starts, so the error page's onPageFinished keeps the overlay.
+    private var failed = false
+    // After release the WebView is gone or going: nothing may reload it any more.
+    private var released = false
+    private val retry = Runnable { if (!released) web?.reload() } // reload, not loadUrl: no error entries in the back history
+    private val connectivity = ctx.getSystemService(android.net.ConnectivityManager::class.java)
+    private val network = object : android.net.ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(n: android.net.Network) {
+            handler.post {
+                // Only while the current load is the failed one: a new navigation (Início, search) must not be replaced.
+                if (released || !failed) return@post
+                handler.removeCallbacks(retry)
+                retry.run()
+            }
+        }
+    }
+
+    init {
+        connectivity.registerNetworkCallback(
+            android.net.NetworkRequest.Builder()
+                .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                .build(),
+            network,
+        )
+    }
+
+    fun release() {
+        released = true
+        web = null
+        handler.removeCallbacks(retry)
+        connectivity.unregisterNetworkCallback(network)
+    }
+
+    /** The page loaded without a network error. */
+    open fun onLoaded(view: WebView) {}
+
+    override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
+        if (released) return
+        web = view
+        failed = false
+        handler.removeCallbacks(retry) // a new load (or the retry itself) is under way
+    }
+
+    // HTTP errors come through onReceivedHttpError; this one is every other load error, network or not.
+    override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+        if (released || !request.isForMainFrame || !isNetworkError(error.errorCode)) return
+        web = view
+        failed = true
+        overlay.visibility = View.VISIBLE
+        handler.removeCallbacks(retry)
+        handler.postDelayed(retry, 5000)
+    }
+
+    override fun onPageFinished(view: WebView, url: String?) {
+        if (failed) return // WebView's own error page under the overlay
+        overlay.visibility = View.GONE
+        handler.removeCallbacks(retry)
+        onLoaded(view)
+    }
+}
+
+/**
+ * Phone remote bar under the page: the car's video (art, title, channel), play/pause, previous, next and a seek bar,
+ * all through [car], the shared media session. Hidden until the session has a video or a pending one.
+ */
+private class RemoteBar(ctx: Context, private val car: MediaController) : android.widget.LinearLayout(ctx) {
+    private fun dp(n: Int) = (n * resources.displayMetrics.density).toInt()
+    private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val art = android.widget.ImageView(ctx).apply { scaleType = android.widget.ImageView.ScaleType.CENTER_CROP }
+    private val title = text(16f)
+    private val channel = text(13f).apply { alpha = 0.7f }
+    private val playPause = button(R.drawable.ic_play_arrow, R.string.play) {
+        if (car.playbackState?.state == PlaybackState.STATE_PLAYING) car.transportControls.pause() else car.transportControls.play()
+    }
+    private val position = text(12f)
+    private val duration = text(12f)
+    private val controls = android.widget.LinearLayout(ctx).apply {
+        addView(button(R.drawable.ic_skip_previous, R.string.previous) { car.transportControls.skipToPrevious() })
+        addView(playPause)
+        addView(button(R.drawable.ic_skip_next, R.string.next) { car.transportControls.skipToNext() })
+        addView(button(R.drawable.ic_tune, R.string.playback_options) { showMenu(this) })
+    }
+    private var dragging = false
+    private val seek = android.widget.SeekBar(ctx).apply {
+        setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(b: android.widget.SeekBar, p: Int, fromUser: Boolean) {
+                if (fromUser) position.text = clock(p.toLong())
+            }
+            override fun onStartTrackingTouch(b: android.widget.SeekBar) { dragging = true }
+            override fun onStopTrackingTouch(b: android.widget.SeekBar) {
+                dragging = false
+                car.transportControls.seekTo(b.progress * 1000L)
+            }
+        })
+    }
+    // -10 s and +10 s sit at the ends of the time row: the top row has no room left on narrow phones.
+    private val rewind = button(R.drawable.ic_replay_10, R.string.rewind_10) { car.transportControls.sendCustomAction(REWIND, null) }
+    private val forward = button(R.drawable.ic_forward_10, R.string.forward_10) { car.transportControls.sendCustomAction(FORWARD, null) }
+    private val timeRow = android.widget.LinearLayout(ctx).apply {
+        gravity = android.view.Gravity.CENTER_VERTICAL
+        addView(rewind)
+        addView(position)
+        addView(seek, LayoutParams(0, -2, 1f))
+        addView(duration)
+        addView(forward)
+    }
+    private val callback = object : MediaController.Callback() {
+        override fun onMetadataChanged(m: MediaMetadata?) = update()
+        override fun onPlaybackStateChanged(s: PlaybackState?) = update()
+    }
+    private var carOpen = carPlaying()
+    private val tick = object : Runnable {
+        override fun run() {
+            if (carPlaying() != carOpen) update() // the car player came or went: no session event for that
+            updateTime()
+            handler.postDelayed(this, 1000)
+        }
+    }
+
+    init {
+        orientation = VERTICAL
+        setBackgroundColor(0xFF1F1F1F.toInt())
+        setPadding(dp(12), dp(8), dp(4), dp(4))
+        addView(android.widget.LinearLayout(ctx).apply {
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            addView(art, LayoutParams(dp(64), dp(36)))
+            addView(android.widget.LinearLayout(ctx).apply {
+                orientation = VERTICAL
+                setPadding(dp(10), 0, dp(4), 0)
+                addView(title)
+                addView(channel)
+            }, LayoutParams(0, -2, 1f))
+            addView(controls)
+        })
+        addView(timeRow)
+        car.registerCallback(callback, handler)
+        update()
+        handler.post(tick)
+    }
+
+    fun release() {
+        handler.removeCallbacks(tick)
+        car.unregisterCallback(callback)
+    }
+
+    // Proporção (cycles and saves, like the car button), Qualidade and Velocidade (saved, then pushed to the car video).
+    private fun showMenu(anchor: View) {
+        val ctx = context
+        android.widget.PopupMenu(ctx, anchor).apply {
+            menu.add(ctx.getString(R.string.aspect_value, ctx.label(ASPECT, choice(prefs(ctx), ASPECT)))).setOnMenuItemClickListener {
+                android.widget.Toast.makeText(ctx, ctx.getString(R.string.aspect_value, cycleAspect(ctx)), android.widget.Toast.LENGTH_SHORT).show()
+                true
+            }
+            for (c in listOf(QUALITY, SPEED)) {
+                val sub = menu.addSubMenu(ctx.getString(c.title) + ": " + ctx.label(c, choice(prefs(ctx), c)))
+                c.options.forEach { (key, label) ->
+                    sub.add(label).setOnMenuItemClickListener {
+                        setChoice(prefs(ctx), c, key)
+                        carLink?.applyPlayback()
+                        true
+                    }
+                }
+            }
+            show()
+        }
+    }
+
+    private fun text(size: Float) = android.widget.TextView(context).apply {
+        textSize = size
+        setTextColor(android.graphics.Color.WHITE)
+        maxLines = 1
+        ellipsize = android.text.TextUtils.TruncateAt.END
+    }
+
+    // 48 dp touch target, system ripple, and a spoken [label].
+    private fun button(icon: Int, label: Int, onClick: () -> Unit) = android.widget.ImageButton(context).apply {
+        setImageResource(icon)
+        contentDescription = context.getString(label)
+        setBackgroundResource(context.obtainStyledAttributes(intArrayOf(android.R.attr.selectableItemBackgroundBorderless)).run {
+            getResourceId(0, 0).also { recycle() }
+        })
+        minimumWidth = dp(48)
+        minimumHeight = dp(48)
+        imageTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.WHITE)
+        setOnClickListener { onClick() }
+    }
+
+    private fun update() {
+        val m = car.metadata
+        val s = car.playbackState
+        // A video sent while no car screen is alive leaves only the session's error message ("Abra o YT Auto...").
+        val pending = s?.state == PlaybackState.STATE_ERROR
+        carOpen = carPlaying()
+        // Nothing to control and no car screen: say where videos play, since the phone never plays them.
+        val notice = !pending && m == null && !carOpen
+        visibility = if (m != null || pending || notice) VISIBLE else GONE
+        title.text = when {
+            pending -> s?.errorMessage
+            notice -> context.getString(R.string.phone_notice)
+            else -> m?.getString(MediaMetadata.METADATA_KEY_TITLE)
+        }
+        title.maxLines = if (pending) 4 else if (notice) 2 else 1 // pending: the steps to show the car screen
+        channel.text = if (pending || notice) "" else m?.getString(MediaMetadata.METADATA_KEY_ARTIST)
+        art.setImageBitmap(if (pending || notice) null else m?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART))
+        // Only a message: nothing to play, pause or seek yet.
+        val message = if (pending || notice) GONE else VISIBLE
+        art.visibility = message
+        controls.visibility = message
+        timeRow.visibility = message
+        val isPlaying = s?.state == PlaybackState.STATE_PLAYING
+        playPause.setImageResource(if (isPlaying) R.drawable.ic_pause else R.drawable.ic_play_arrow)
+        playPause.contentDescription = context.getString(if (isPlaying) R.string.pause else R.string.play)
+        val d = (m?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L) / 1000
+        seek.max = d.toInt()
+        // No duration yet (new video, ad, live): a touch would seek the car to 0.
+        seek.isEnabled = d > 0 && carOpen
+        rewind.isEnabled = carOpen
+        forward.isEnabled = carOpen
+        // Metadata from earlier but no car player now: nothing would answer the buttons.
+        controls.alpha = if (carOpen) 1f else 0.4f
+        for (i in 0 until controls.childCount) controls.getChildAt(i).isEnabled = carOpen
+        if (!carOpen && !pending && m != null) channel.text = context.getString(R.string.open_car_to_control)
+        duration.text = clock(d)
+        updateTime()
+    }
+
+    // Position extrapolated from the last report, so the bar moves every second between the car's 500 ms reports.
+    private fun updateTime() {
+        val s = car.playbackState ?: return
+        if (dragging || s.position < 0) return
+        val elapsed = if (s.state == PlaybackState.STATE_PLAYING) android.os.SystemClock.elapsedRealtime() - s.lastPositionUpdateTime else 0
+        val max = seek.max.toLong()
+        // Clamped: the state stays PLAYING through ads, while time reports stop.
+        val seconds = ((s.position + elapsed * s.playbackSpeed).toLong() / 1000).let { if (max > 0) it.coerceAtMost(max) else it }
+        seek.progress = seconds.toInt()
+        position.text = clock(seconds)
+    }
+}
+
+// Moving above 2 m/s (7 km/h), stopped again below 0.5 m/s: the gap keeps a crawl in traffic from flickering.
+// ponytail: thresholds picked, not measured; retune if the cover lags at a stop or blinks in stop-and-go
+internal fun movingAfter(was: Boolean, mps: Float) = if (was) mps >= 0.5f else mps > 2f
+
+/**
+ * Black loading screen: wifi_off icon, spinner (phone only), "Sem conexão. Tentando de novo…" and "Verifique a internet do celular",
+ * hidden until a page fails. Sizes in dp of [ctx]'s display (the car's virtual display on the car); [car] sets the
+ * 20 sp text floor of the car overlays.
+ */
+private fun offlineView(ctx: Context, car: Boolean = false): View = FrameLayout(ctx).apply {
+    val dp = ctx.resources.displayMetrics.density
+    setBackgroundColor(android.graphics.Color.BLACK)
+    visibility = View.GONE
+    isClickable = true // taps don't reach the error page underneath
+    addView(
+        android.widget.LinearLayout(ctx).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            gravity = android.view.Gravity.CENTER_HORIZONTAL
+            addView(android.widget.ImageView(ctx).apply {
+                setImageResource(R.drawable.ic_wifi_off)
+                imageTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.WHITE)
+                setPadding(0, 0, 0, (16 * dp).toInt())
+            }, android.widget.LinearLayout.LayoutParams((72 * dp).toInt(), (88 * dp).toInt()))
+            // Car: no spinner. At the car's low density it draws as a stray dash and competes with the icon; the title
+            // already says it is retrying.
+            if (!car) addView(android.widget.ProgressBar(ctx, null, android.R.attr.progressBarStyleLarge).apply {
+                isIndeterminate = true
+                indeterminateTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.WHITE)
+            })
+            addView(android.widget.TextView(ctx).apply {
+                setText(R.string.offline_retrying)
+                setTextColor(android.graphics.Color.WHITE)
+                textSize = if (car) 24f else 20f
+                gravity = android.view.Gravity.CENTER
+                setPadding(0, (24 * dp).toInt(), 0, 0)
+            }, android.widget.LinearLayout.LayoutParams(-2, -2))
+            addView(android.widget.TextView(ctx).apply {
+                setText(R.string.offline_hint)
+                setTextColor(0xB3FFFFFF.toInt())
+                textSize = if (car) 20f else 16f
+                gravity = android.view.Gravity.CENTER
+                setPadding(0, (8 * dp).toInt(), 0, 0)
+            }, android.widget.LinearLayout.LayoutParams(-2, -2))
+        },
+        FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, android.view.Gravity.CENTER),
+    )
+}
+
+/** Car settings (CAR_SETTINGS), same values as the phone's Settings menu. [onChanged] re-applies them to the live page. */
+class SettingsScreen(ctx: CarContext, private val onGo: (String) -> Unit, private val onChanged: () -> Unit) : Screen(ctx) {
+    override fun onGetTemplate(): ListTemplate {
+        val list = ItemList.Builder()
+        fun icon(id: Int) = CarIcon.Builder(IconCompat.createWithResource(carContext, id)).build()
+        // Go to: Início, Inscrições, Histórico, Playlists (the home icon opens the start page itself).
+        list.addItem(Row.Builder().setTitle(carContext.getString(R.string.go_to)).setImage(icon(R.drawable.ic_video_library)).setBrowsable(true)
+            .setOnClickListener { screenManager.push(HomeMenuScreen(carContext, onGo)) }.build())
+        CAR_SETTINGS.forEach { (key, img) ->
+            val c = CHOICES.find { it.key == key }
+            val row = Row.Builder().setImage(icon(img))
+            if (c != null) {
+                row.setTitle(carContext.getString(c.title)).addText(carContext.label(c, choice(carContext, c))).setBrowsable(true)
+                    .setOnClickListener {
+                        screenManager.push(ChoiceScreen(carContext, c) {
+                            invalidate()
+                            onChanged()
+                        })
+                    }
+            } else {
+                val f = FLAGS.first { it.key == key }
+                row.setTitle(carContext.getString(f.title))
+                    .setToggle(Toggle.Builder { on ->
+                        setFlag(carContext, f.key, on)
+                        // The car cannot open the phone's access screen: point there.
+                        if (f.key == "navOverlay" && on && !carContext.navAccess())
+                            CarToast.makeText(carContext, R.string.nav_access_needed, CarToast.LENGTH_LONG).show()
+                        onChanged()
+                    }.setChecked(flag(carContext, f.key)).build())
+            }
+            list.addItem(row.build())
+        }
+        // The gestures have no button: here they can be read again after the first tips.
+        list.addItem(Row.Builder().setTitle(carContext.getString(R.string.gestures)).setImage(icon(R.drawable.ic_forward_10)).setBrowsable(true)
+            .setOnClickListener { screenManager.push(GesturesScreen(carContext)) }.build())
+        // Points to the phone's full settings; a tap says where they are, so the row is never a dead end.
+        list.addItem(Row.Builder().setTitle(carContext.getString(R.string.more_on_phone)).setImage(icon(R.drawable.ic_smartphone))
+            .setOnClickListener { CarToast.makeText(carContext, R.string.more_on_phone_how, CarToast.LENGTH_LONG).show() }.build())
+        return ListTemplate.Builder()
+            .setTitle(carContext.getString(R.string.settings))
+            .setHeaderAction(Action.BACK)
+            .setSingleList(list.build())
+            .build()
+    }
+}
+
+/** Single-choice picker for one [Choice] setting. */
+private class ChoiceScreen(ctx: CarContext, private val c: Choice, private val onPicked: () -> Unit) : Screen(ctx) {
+    override fun onGetTemplate(): ListTemplate {
+        val keys = c.options.keys.toList()
+        val list = ItemList.Builder()
+        c.options.values.forEach { list.addItem(Row.Builder().setTitle(carContext.getString(it)).build()) }
+        list.setSelectedIndex(keys.indexOf(choice(carContext, c)))
+        list.setOnSelectedListener { i ->
+            setChoice(carContext, c, keys[i])
+            onPicked()
+            screenManager.pop()
+        }
+        return ListTemplate.Builder()
+            .setTitle(carContext.getString(c.title))
+            .setHeaderAction(Action.BACK)
+            .setSingleList(list.build())
+            .build()
+    }
+}
+
+/** Car home menu (HOME_MENU): picking a page hands its URL to [onPick] and closes the list. */
+class HomeMenuScreen(ctx: CarContext, private val onPick: (String) -> Unit) : Screen(ctx) {
+    override fun onGetTemplate(): ListTemplate {
+        val list = ItemList.Builder()
+        HOME_MENU.forEach { (url, title, icon) ->
+            list.addItem(
+                Row.Builder().setTitle(carContext.getString(title))
+                    .setImage(CarIcon.Builder(IconCompat.createWithResource(carContext, icon)).build())
+                    .setOnClickListener {
+                        onPick(url)
+                        screenManager.pop()
+                    }
+                    .build()
+            )
+        }
+        return ListTemplate.Builder()
+            .setTitle(carContext.getString(R.string.go_to)) // not "Página inicial": that is the start page setting
+            .setHeaderAction(Action.BACK)
+            .setSingleList(list.build())
+            .build()
+    }
+}
+
+/** "Entre pelo celular": shown instead of Google's sign-in form, which needs a keyboard the car lacks. OK goes back. */
+/** The car video gestures as (title, detail, icon) rows, in the order the gestures matter (spec critique-fixes). */
+internal val GESTURE_ROWS = listOf(
+    Triple(R.string.gesture_double_tap, R.string.gesture_double_tap_text, R.drawable.ic_forward_10),
+    Triple(R.string.gesture_drag, R.string.gesture_drag_text, R.drawable.ic_fast_forward),
+    Triple(R.string.gesture_bar, R.string.gesture_bar_text, R.drawable.ic_skip_next),
+)
+
+/** The car video gestures, for whoever missed the tips: one short row each, read at a glance. */
+class GesturesScreen(ctx: CarContext) : Screen(ctx) {
+    override fun onGetTemplate(): ListTemplate {
+        val list = ItemList.Builder()
+        for ((title, text, icon) in GESTURE_ROWS) list.addItem(
+            Row.Builder().setTitle(carContext.getString(title)).addText(carContext.getString(text))
+                .setImage(CarIcon.Builder(IconCompat.createWithResource(carContext, icon)).build()).build()
+        )
+        return ListTemplate.Builder()
+            .setTitle(carContext.getString(R.string.gestures))
+            .setHeaderAction(Action.BACK)
+            .setSingleList(list.build())
+            .build()
+    }
+}
+
+class SignInScreen(ctx: CarContext) : Screen(ctx) {
+    override fun onGetTemplate() = MessageTemplate.Builder(carContext.getString(R.string.signin_car_text))
+        .setTitle(carContext.getString(R.string.signin_car_title))
+        .setIcon(CarIcon.Builder(IconCompat.createWithResource(carContext, R.drawable.ic_smartphone)).build())
+        .addAction(Action.Builder().setTitle(carContext.getString(android.R.string.ok)).setOnClickListener { screenManager.pop() }.build())
+        .build()
+}
+
+/** Car keyboard: the virtual display has no IME, so text input goes through the host's SearchTemplate. */
+class SearchScreen(ctx: CarContext, private val onQuery: (String) -> Unit) : Screen(ctx) {
+    private fun search(q: String) {
+        val prefs = prefs(carContext)
+        prefs.edit().putString("recentSearches", addRecentSearch(recentSearches(prefs), q).joinToString("\n")).apply()
+        onQuery(q)
+        screenManager.pop()
+    }
+
+    // Recent searches as one-tap rows: typing on the car keyboard is the slow part. None yet: say what to do.
+    override fun onGetTemplate(): SearchTemplate {
+        val list = ItemList.Builder().setNoItemsMessage(carContext.getString(R.string.search_hint))
+        for (q in recentSearches(prefs(carContext))) list.addItem(
+            Row.Builder().setTitle(q).setImage(CarIcon.Builder(IconCompat.createWithResource(carContext, R.drawable.ic_history)).build())
+                .setOnClickListener { search(q) }.build()
+        )
+        return SearchTemplate.Builder(object : SearchTemplate.SearchCallback {
+            override fun onSearchSubmitted(searchText: String) = search(searchText)
+        })
+            .setHeaderAction(Action.BACK)
+            // Car microphone: say it instead of typing (CarVoiceScreen).
+            .setActionStrip(ActionStrip.Builder().addAction(
+                Action.Builder().setIcon(CarIcon.Builder(IconCompat.createWithResource(carContext, R.drawable.ic_mic)).build())
+                    .setOnClickListener { screenManager.push(CarVoiceScreen(carContext) { q -> search(q) }) }.build()
+            ).build())
+            .setShowKeyboardByDefault(true)
+            .setItemList(list.build())
+            .build()
+    }
+}
+
+internal fun recentSearches(prefs: SharedPreferences) = prefs.getString("recentSearches", "").orEmpty().lines().filter { it.isNotBlank() }
+
+/** [recent] with [q] first: blank ignored, an earlier same search (any case) moved up, at most 5 kept. */
+internal fun addRecentSearch(recent: List<String>, q: String): List<String> {
+    val t = q.trim()
+    if (t.isEmpty()) return recent
+    return (listOf(t) + recent.filterNot { it.equals(t, ignoreCase = true) }).take(5)
+}
+
+// GPS speed for the car's audio-only cover (see YoutubeScreen.listenSpeed); only the phone can show the prompt.
+internal fun Activity.requestLocation() {
+    if (checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) != android.content.pm.PackageManager.PERMISSION_GRANTED)
+        requestPermissions(arrayOf(android.Manifest.permission.ACCESS_FINE_LOCATION, android.Manifest.permission.ACCESS_COARSE_LOCATION), 1)
+}
+
+// Latest release of this app on GitHub: the app isn't on the Play Store, so it checks there for updates.
+private const val RELEASES_API = "https://api.github.com/repos/skaterdav21/TubeAuto/releases/latest"
+
+// Corners and progress bar of the car's centered panels (drag, end countdown): one look, as the turn card's corners.
+internal const val PANEL_CORNER_DP = 16
+internal const val PANEL_BAR_DP = 6
+
+/**
+ * The car's side strip (spec prev-next): on a video, previous, next (only when YouTube has one), aspect and settings;
+ * elsewhere settings only, as the aspect changes nothing off a video (spec critique-fixes). The host allows four.
+ */
+internal fun mapStrip(onWatch: Boolean, hasNext: Boolean) =
+    if (!onWatch) listOf("settings") else listOfNotNull("previous", "next".takeIf { hasNext }, "aspect", "settings")
+
+/**
+ * Script for previous, from the car's side strip and from the steering wheel / media card alike: the previous video
+ * in YouTube's queue when there is one, else the start of the current video.
+ */
+internal fun previousJs(hasPrevious: Boolean) = if (hasPrevious) JS_PREVIOUS else JS_RESTART
+
+// Install check (spec install-check): Android Auto in the car hides the video screen of apps whose recorded installer
+// is not the Play Store, and KingInstaller is what records it; adb or opening the APK over it clears that.
+internal const val KING_PACKAGE = "com.example.kinginstaller"
+internal const val KING_RELEASES = "https://github.com/fcaronte/KingInstaller/releases"
+
+/** Whether to warn: installer not the Play Store, unless ignored for this very install ([updatedAt] = lastUpdateTime). */
+internal fun installWarning(installer: String?, updatedAt: Long, ignoredAt: Long) =
+    installer != "com.android.vending" && ignoredAt != updatedAt
+
+internal enum class KingAction { OPEN, DOWNLOAD }
+
+internal fun kingAction(kingInstalled: Boolean) = if (kingInstalled) KingAction.OPEN else KingAction.DOWNLOAD
+
+/**
+ * Title and text of the warning: with KingInstaller on the phone it was most likely used and its method did not
+ * record the Play Store (the install origin is hidden from apps), so ask for another method (spec install-check, INST-08).
+ */
+internal fun installTexts(kingInstalled: Boolean) =
+    if (kingInstalled) R.string.install_title_king to R.string.install_text_king else R.string.install_title to R.string.install_text
+
+internal fun Context.kingInstalled() = packageManager.getLaunchIntentForPackage(KING_PACKAGE) != null
+
+/** Notify when Android Auto (the car) binds the media service and the install is wrong. */
+internal fun notifyInstall(client: String, warning: Boolean) = warning && client == "com.google.android.projection.gearhead"
+
+/** A car session opening (Android Auto connects without binding the media card) notifies whenever the install is wrong. */
+internal fun notifyOnSession(warning: Boolean) = warning
+
+// This install's recorded installer and lastUpdateTime, and whether to warn about it (see installWarning).
+internal fun Context.installWarningNow(): Boolean {
+    val installer = runCatching {
+        if (android.os.Build.VERSION.SDK_INT >= 30) packageManager.getInstallSourceInfo(packageName).installingPackageName
+        else @Suppress("DEPRECATION") packageManager.getInstallerPackageName(packageName)
+    }.getOrNull()
+    if (!flag(this, "installWarning")) return false
+    return installWarning(installer, installedAt(), prefs(this).getLong("installIgnoredAt", 0L))
+}
+
+internal fun Context.installedAt() = packageManager.getPackageInfo(packageName, 0).lastUpdateTime
+
+// Last wrong-install notification (uptime): the car session and the media card both bind on one connection.
+private var installNotifiedAt = Long.MIN_VALUE / 2
+
+/** Whether a wrong-install notification is due [now], the last one posted at [last]: at most once per 10 minutes. */
+internal fun notifyDue(now: Long, last: Long) = now - last >= 600_000
+
+/** Notification "Reinstale pelo KingInstaller"; tapping it opens the phone app with the strip. Once per 10 minutes. */
+internal fun Context.notifyWrongInstall() {
+    val now = SystemClock.uptimeMillis()
+    if (!notifyDue(now, installNotifiedAt)) return
+    installNotifiedAt = now
+    val (title, text) = installTexts(kingInstalled())
+    val nm = getSystemService(android.app.NotificationManager::class.java)
+    nm.createNotificationChannel(android.app.NotificationChannel(
+        "install", getString(R.string.install_channel), android.app.NotificationManager.IMPORTANCE_HIGH))
+    val open = android.app.PendingIntent.getActivity(this, 0, Intent(this, LoginActivity::class.java),
+        android.app.PendingIntent.FLAG_IMMUTABLE or android.app.PendingIntent.FLAG_UPDATE_CURRENT)
+    runCatching { // no permission (Android 13+ denied): the phone strip still shows
+        nm.notify(1, android.app.Notification.Builder(this, "install")
+            .setSmallIcon(R.drawable.ic_flag)
+            .setContentTitle(getString(title))
+            .setContentText(getString(text))
+            .setStyle(android.app.Notification.BigTextStyle().bigText(getString(text)))
+            .setContentIntent(open)
+            .setAutoCancel(true)
+            .build())
+    }
+}
+
+/**
+ * Whether a video that [ended] (for [endedForMs]) should start the countdown back to the start page (spec video-end):
+ * with autoplay off ([autonav] false) nothing comes next, so at once; on or unknown, only if YouTube opened nothing in
+ * 10 s.
+ */
+internal fun endCountdownDue(ended: Boolean, autonav: Boolean?, endedForMs: Long) =
+    ended && (autonav == false || endedForMs >= 10_000)
+
+/** Whether release tag [tag] ("v1.1") is a newer version than [current] ("1.0"), number by number. */
+internal fun isNewer(tag: String, current: String): Boolean {
+    fun parts(v: String) = v.trim().trimStart('v', 'V').split('.').map { p -> p.takeWhile(Char::isDigit).toIntOrNull() ?: 0 }
+    val a = parts(tag)
+    val b = parts(current)
+    for (i in 0 until maxOf(a.size, b.size)) {
+        val x = a.getOrElse(i) { 0 }
+        val y = b.getOrElse(i) { 0 }
+        if (x != y) return x > y
+    }
+    return false
+}
+
+// Phone sign-in banner: shown while signed out, unless closed since the last sign-in state change.
+internal fun bannerShown(signedIn: Boolean, closedWhileSignedOut: Boolean) = !signedIn && !closedWhileSignedOut
+// The car's gestures have no buttons: the first video played on a watch page tells about them, once per install,
+// while the video is on screen (not behind another app or the audio-only cover).
+internal fun takeGestureHint(prefs: SharedPreferences, onWatch: Boolean, visible: Boolean, shownThisSession: Boolean): Boolean {
+    if (!onWatch || !visible || shownThisSession) return false
+    // A passenger or another driver uses the car too: the hint comes back on the first video of each car screen, for
+    // the first GESTURE_HINT_SESSIONS of them. The old once-only flag counts as one.
+    val shown = prefs.getInt("gestureHints", if (prefs.getBoolean("gestureHintShown", false)) 1 else 0)
+    if (shown >= GESTURE_HINT_SESSIONS) return false
+    prefs.edit().putInt("gestureHints", shown + 1).apply()
+    return true
+}
+
+internal const val GESTURE_HINT_SESSIONS = 3
+
+// Turn-by-turn from Waze or Google Maps: Android Auto hides their turn card while this (navigation-category) app is in
+// front, so the next turn is read from their ongoing navigation notification and drawn over the car screen.
+internal val NAV_APPS = setOf("com.waze", "com.google.android.apps.maps")
+
+// [icon] is the notification's large icon (Maps' turn arrow); Waze has none, so the words pick one (maneuverOf).
+// [app] is the package that posted it, shown as a badge on the maneuver icon.
+internal data class NavInstruction(val distance: String, val maneuver: String, val icon: android.graphics.drawable.Icon? = null, val app: String = "")
+
+internal fun navInstruction(pkg: String, category: String?, title: CharSequence?, text: CharSequence?): NavInstruction? {
+    if (pkg !in NAV_APPS || category != "navigation") return null
+    val d = title?.toString()?.trim().orEmpty()
+    val m = text?.toString()?.trim().orEmpty()
+    if (d.isEmpty() && m.isEmpty()) return null
+    // Maps puts the instruction in the title before the first turn ("Siga em direção à ..."): not a distance.
+    if (d.isNotEmpty() && !NAV_DISTANCE.matches(d)) return NavInstruction("", listOf(d, m).filter { it.isNotEmpty() }.joinToString(", "))
+    return NavInstruction(d, m)
+}
+
+// "10 m", "1,2 km", "0.5 mi", "½ mi", "٢٠٠ م": a digit or a fraction first, at most 12 characters.
+private val NAV_DISTANCE = Regex("""[\p{Nd}¼½¾].{0,11}""")
+
+// Navigation notifications still posted, by key; the last posted one shows (Waze and Maps both navigating).
+internal class NavFeed {
+    private val posted = LinkedHashMap<String, NavInstruction>()
+    fun post(key: String, i: NavInstruction) {
+        posted.remove(key) // re-insert: an update makes it the latest
+        posted[key] = i
+    }
+    fun remove(key: String) = posted.remove(key)
+    fun clear() = posted.clear()
+    val current get() = posted.values.lastOrNull()
+}
+
+// Phone switch state on screen: stored on and access granted (stored on without access does nothing).
+internal fun navSwitchShown(stored: Boolean, access: Boolean) = stored && access
+
+internal fun navToShow(prefs: SharedPreferences, feed: NavFeed) = if (flag(prefs, "navOverlay")) feed.current else null
+
+// Filled by NavListener, read by the car screen; both run on the main thread.
+internal val navFeed = NavFeed()
+internal var onNavChanged: (() -> Unit)? = null
+
+/** Reads the navigation notifications of NAV_APPS into [navFeed]; Android runs it once notification access is granted. */
+class NavListener : android.service.notification.NotificationListenerService() {
+    override fun onListenerConnected() {
+        runCatching { activeNotifications }.getOrNull()?.forEach(::onNotificationPosted)
+    }
+
+    override fun onNotificationPosted(sbn: android.service.notification.StatusBarNotification) {
+        val n = sbn.notification
+        val i = navInstruction(
+            sbn.packageName, n.category,
+            n.extras.getCharSequence(android.app.Notification.EXTRA_TITLE), n.extras.getCharSequence(android.app.Notification.EXTRA_TEXT),
+        )
+        // An update that is no longer an instruction ends it, like a removal.
+        if (i == null) navFeed.remove(sbn.key) ?: return else navFeed.post(sbn.key, i.copy(icon = n.getLargeIcon(), app = sbn.packageName))
+        onNavChanged?.invoke()
+    }
+
+    override fun onNotificationRemoved(sbn: android.service.notification.StatusBarNotification) {
+        if (navFeed.remove(sbn.key) != null) onNavChanged?.invoke()
+    }
+
+    // Access revoked (or the listener unbound): no more updates, so nothing stale stays on screen.
+    override fun onListenerDisconnected() {
+        navFeed.clear()
+        onNavChanged?.invoke()
+    }
+}
+
+internal fun Context.navAccess() = getSystemService(android.app.NotificationManager::class.java)
+    .isNotificationListenerAccessGranted(android.content.ComponentName(this, NavListener::class.java))
+
+internal enum class Maneuver { ARRIVE, ROUNDABOUT, U_TURN, KEEP_LEFT, KEEP_RIGHT, LEFT, RIGHT, STRAIGHT }
+
+// Words per maneuver in the app's 7 languages (the text is in Waze's or Maps' language). Checked in this order:
+// a roundabout text also says "exit", a keep/exit text also says the side.
+// ponytail: keyword guess; Maps' own arrow wins when the notification has one, unknown wording falls back to straight
+// Whole words only, so a street name or a passing word does not pick the icon ("Rua do Retorno", "When you turn left",
+// "вокруг квартала"). \b is spelled out with letter classes: Android's ICU rejects the (?U) flag the JVM needs for a
+// Unicode \b, and a bad pattern here crashes the whole app at class load.
+private val WORD_EDGE = "(?:(?<![\\p{L}\\p{N}])(?=[\\p{L}\\p{N}])|(?<=[\\p{L}\\p{N}])(?![\\p{L}\\p{N}]))"
+private fun words(p: String) = Regex(p.replace("\\b", WORD_EDGE))
+private val NAV_WORDS = listOf(
+    Maneuver.ARRIVE to words("\\bchegou\\b|chegada ao destino|\\barriv|\\bllegado\\b|\\bllegada\\b|\\barrivat|\\barrivé|прибыли|прибытие|وصلت"),
+    Maneuver.ROUNDABOUT to words("rotat[óo]ria|\\brotunda|roundabout|traffic circle|\\brotonda|glorieta|rond-point|кругов|по кругу|кольц|دوار"),
+    Maneuver.U_TURN to words("fa[çc]a o retorno|\\bretorne\\b|meia.volta|\\bu.?turn\\b|cambio de sentido|vuelta en u|demi-tour|inversione|\\binverti|развернит|разворот|للخلف|استدر"),
+)
+private val KEEP_WORDS = words("mantenha|sa[íi]da|\\bsaia\\b|\\bkeep\\b|\\bexit\\b|\\bramp|mant[eé]n|salida|restez|serrez|sortie|tieni|uscita|держит|съезд|ابق|الزم|مخرج")
+private val LEFT_WORDS = words("esquerda|\\bleft\\b|izquierda|gauche|sinistra|налево|левее|влево|слева|левой|يسار")
+private val RIGHT_WORDS = words("direita|\\bright\\b|derecha|droite|destra|направо|правее|вправо|справа|правой|يمين")
+
+internal fun maneuverOf(text: String): Maneuver {
+    val t = text.lowercase()
+    NAV_WORDS.firstOrNull { it.second.containsMatchIn(t) }?.let { return it.first }
+    // Two sides in one text ("left, then right"): the first is the turn coming up.
+    val left = LEFT_WORDS.find(t)?.range?.first ?: Int.MAX_VALUE
+    val right = RIGHT_WORDS.find(t)?.range?.first ?: Int.MAX_VALUE
+    if (left == right) return Maneuver.STRAIGHT
+    val keep = KEEP_WORDS.containsMatchIn(t)
+    return when {
+        left < right -> if (keep) Maneuver.KEEP_LEFT else Maneuver.LEFT
+        else -> if (keep) Maneuver.KEEP_RIGHT else Maneuver.RIGHT
+    }
+}
+
+internal fun maneuverIcon(m: Maneuver) = when (m) {
+    Maneuver.ARRIVE -> R.drawable.ic_flag
+    Maneuver.ROUNDABOUT -> R.drawable.ic_roundabout_right
+    Maneuver.U_TURN -> R.drawable.ic_u_turn_left
+    Maneuver.KEEP_LEFT -> R.drawable.ic_turn_slight_left
+    Maneuver.KEEP_RIGHT -> R.drawable.ic_turn_slight_right
+    Maneuver.LEFT -> R.drawable.ic_turn_left
+    Maneuver.RIGHT -> R.drawable.ic_turn_right
+    Maneuver.STRAIGHT -> R.drawable.ic_straight
+}
+
+internal fun bannerClosed(prefs: SharedPreferences) = prefs.getBoolean("bannerClosed", false)
+internal fun closeBanner(prefs: SharedPreferences) = prefs.edit().putBoolean("bannerClosed", true).apply()
+
+/** Records the sign-in state [signedIn]; a change clears the banner's closing. True when it went from out to in. */
+internal fun signInChanged(prefs: SharedPreferences, signedIn: Boolean): Boolean {
+    val was = prefs.getBoolean("signedIn", signedIn) // first run: no change
+    val edit = prefs.edit().putBoolean("signedIn", signedIn)
+    if (was != signedIn) edit.putBoolean("bannerClosed", false)
+    edit.apply()
+    return !was && signedIn
+}
+
+// Google's sign-in for YouTube, back to the mobile site; the same link as the page's own "Fazer login".
+private const val SIGN_IN_URL = "https://accounts.google.com/ServiceLogin?service=youtube&uilel=3&passive=true&continue=" +
+    "https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue%26app%3Dm%26next%3D%252F"
+
+/**
+ * Phone launcher screen: YouTube, signed in or not (sign in from the page). WebView cookies are app-wide, so the car WebView
+ * picks up the session. Google rejects embedded WebViews by the "; wv" UA token, hence the strip.
+ */
+// ponytail: UA trick can break if Google tightens WebView detection; fallback is a cookie export from a real browser
+class LoginActivity : Activity() {
+    private var client: OfflineRetry? = null
+    private var web: WebView? = null
+    private var bar: RemoteBar? = null
+    private var banner: View? = null
+    private var installBanner: View? = null
+    // Phone -> car: the same session the steering wheel uses; it opens the video in the car, or keeps it for later.
+    private val car by lazy { MediaController(this, mediaSession(this).sessionToken) }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        TubeLog.init(this)
+        val offline = offlineView(this)
+        val barBox = FrameLayout(this) // the remote bar sets its own visibility; this hides it on Google's sign-in
+        val retrying = object : OfflineRetry(this, offline) {
+            override fun onLoaded(view: WebView) {
+                view.evaluateJavascript(PHONE_JS, null)
+                checkSignIn()
+            }
+
+            // Every main-frame navigation, page loads and in-page ones alike.
+            override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
+                barBox.visibility = if (isCarSignIn(url)) View.GONE else View.VISIBLE
+            }
+        }.also { client = it }
+        bar = RemoteBar(this, car).also { barBox.addView(it) }
+        val page = FrameLayout(this).apply {
+            addView(WebView(context).also { web = it }.apply {
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.userAgentString = settings.userAgentString.replace("; wv", "")
+                settings.mediaPlaybackRequiresUserGesture = true // no autoplay on the phone; PHONE_JS pauses the rest
+                addJavascriptInterface(object {
+                    /** Sends [url]'s video to the car; false when it has no video id (the page then follows the link). */
+                    @JavascriptInterface
+                    fun cast(url: String): Boolean {
+                        val id = videoIdFromUrl(url) ?: return false
+                        runOnUiThread {
+                            if (!carPlaying()) {
+                                android.widget.Toast.makeText(
+                                    this@LoginActivity, R.string.video_saved,
+                                    android.widget.Toast.LENGTH_LONG,
+                                ).show()
+                            }
+                            car.transportControls.playFromMediaId(id, null)
+                        }
+                        return true
+                    }
+                }, "remote")
+                webViewClient = retrying
+                // No sign-in required: the page's own "Fazer login" leads to accounts.google.com in this WebView.
+                loadUrl("https://m.youtube.com")
+            })
+            addView(offline)
+        }
+        setContentView(android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            addView(installBanner().also { installBanner = it })
+            addView(signInBanner().also { banner = it })
+            addView(page, android.widget.LinearLayout.LayoutParams(-1, 0, 1f))
+            addView(PhoneRemoteStrip(this@LoginActivity, car) { startPhoneVoice() })
+            addView(barBox)
+        })
+        checkSignIn()
+        if (savedInstanceState == null) {
+            checkUpdate()
+            // Audio-only turned on in the car: the car can't ask for location, so the phone does on its next launch.
+            if (flag(this, "audioWhileMoving")) requestLocation()
+        }
+    }
+
+    // Back from KingInstaller (or the system) after a reinstall: the warning goes away without restarting the app.
+    override fun onResume() {
+        super.onResume()
+        // KingInstaller may have just been installed (or removed): rebuild the strip so its text and button follow.
+        installBanner?.let { old ->
+            val parent = old.parent as? android.view.ViewGroup ?: return@let
+            val at = parent.indexOfChild(old)
+            parent.removeView(old)
+            parent.addView(installBanner().also { installBanner = it }, at)
+        }
+        checkSignIn()
+    }
+
+    // Spec install-check: flag icon, "Reinstale pelo KingInstaller" and the effect, open/get KingInstaller and X (Ignorar,
+    // until the app is installed again). Same strip as the sign-in banner, which it replaces while shown.
+    private fun installBanner() = android.widget.LinearLayout(this).apply {
+        val dp = resources.displayMetrics.density
+        gravity = android.view.Gravity.CENTER_VERTICAL
+        setBackgroundColor(0xFF1F1F1F.toInt())
+        setPadding((12 * dp).toInt(), (8 * dp).toInt(), 0, (8 * dp).toInt())
+        val white = android.content.res.ColorStateList.valueOf(android.graphics.Color.WHITE)
+        val (title, text) = installTexts(kingInstalled())
+        addView(android.widget.ImageView(context).apply {
+            setImageResource(R.drawable.ic_flag)
+            imageTintList = white
+        })
+        addView(android.widget.LinearLayout(context).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding((12 * dp).toInt(), 0, (8 * dp).toInt(), 0)
+            addView(android.widget.TextView(context).apply {
+                setText(title)
+                setTextColor(android.graphics.Color.WHITE)
+                typeface = android.graphics.Typeface.DEFAULT_BOLD
+            })
+            addView(android.widget.TextView(context).apply {
+                setText(text)
+                setTextColor(0xB3FFFFFF.toInt())
+            })
+            addView(android.widget.Button(context, null, android.R.attr.borderlessButtonStyle).apply {
+                val king = packageManager.getLaunchIntentForPackage(KING_PACKAGE)
+                when (kingAction(king != null)) {
+                    KingAction.OPEN -> { setText(R.string.install_open_king); setOnClickListener { startActivity(king) } }
+                    KingAction.DOWNLOAD -> {
+                        setText(R.string.install_get_king)
+                        setOnClickListener { startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(KING_RELEASES))) }
+                    }
+                }
+                setPadding(0, 0, 0, 0)
+                minWidth = 0
+                minimumWidth = 0
+            })
+        }, android.widget.LinearLayout.LayoutParams(0, -2, 1f))
+        addView(android.widget.ImageButton(context).apply {
+            setImageResource(R.drawable.ic_close)
+            imageTintList = white
+            contentDescription = getString(R.string.install_ignore)
+            setBackgroundResource(obtainStyledAttributes(intArrayOf(android.R.attr.selectableItemBackgroundBorderless)).run {
+                getResourceId(0, 0).also { recycle() }
+            })
+            minimumWidth = (48 * dp).toInt()
+            minimumHeight = (48 * dp).toInt()
+            setOnClickListener {
+                prefs(this@LoginActivity).edit().putLong("installIgnoredAt", installedAt()).apply()
+                checkSignIn()
+            }
+        })
+    }
+
+    // Account icon, "Entre para ver suas inscrições no carro", Entrar (Google's sign-in here) and X (closes until the next change).
+    private fun signInBanner() = android.widget.LinearLayout(this).apply {
+        val dp = resources.displayMetrics.density
+        gravity = android.view.Gravity.CENTER_VERTICAL
+        setBackgroundColor(0xFF1F1F1F.toInt()) // same as the remote bar
+        setPadding((12 * dp).toInt(), (4 * dp).toInt(), 0, (4 * dp).toInt())
+        val white = android.content.res.ColorStateList.valueOf(android.graphics.Color.WHITE)
+        addView(android.widget.ImageView(context).apply {
+            setImageResource(R.drawable.ic_account_circle)
+            imageTintList = white
+        })
+        addView(android.widget.TextView(context).apply {
+            setText(R.string.banner_text)
+            setTextColor(android.graphics.Color.WHITE)
+            setPadding((12 * dp).toInt(), 0, (8 * dp).toInt(), 0)
+        }, android.widget.LinearLayout.LayoutParams(0, -2, 1f))
+        addView(android.widget.Button(context, null, android.R.attr.borderlessButtonStyle).apply {
+            setText(R.string.banner_signin)
+            setOnClickListener { web?.loadUrl(SIGN_IN_URL) }
+        })
+        addView(android.widget.ImageButton(context).apply {
+            setImageResource(R.drawable.ic_close)
+            imageTintList = white
+            contentDescription = getString(R.string.close)
+            setBackgroundResource(obtainStyledAttributes(intArrayOf(android.R.attr.selectableItemBackgroundBorderless)).run {
+                getResourceId(0, 0).also { recycle() }
+            })
+            minimumWidth = (48 * dp).toInt()
+            minimumHeight = (48 * dp).toInt()
+            setOnClickListener {
+                closeBanner(prefs(this@LoginActivity))
+                checkSignIn()
+            }
+        })
+    }
+
+    // SAPISID is the cookie Google sets on sign-in (as in MediaService). On sign-in: toast, and the car reloads signed in.
+    private fun checkSignIn() {
+        val signedIn = "SAPISID=" in CookieManager.getInstance().getCookie("https://m.youtube.com").orEmpty()
+        val p = prefs(this)
+        if (signInChanged(p, signedIn)) {
+            android.widget.Toast.makeText(this, R.string.signed_in_toast, android.widget.Toast.LENGTH_LONG).show()
+            carLink?.reload()
+        }
+        val install = installWarningNow()
+        installBanner?.visibility = if (install) View.VISIBLE else View.GONE
+        // One banner at a time: a wrong install keeps the car from working, signing in does not.
+        banner?.visibility = if (!install && bannerShown(signedIn, bannerClosed(p))) View.VISIBLE else View.GONE
+        // The car notification needs this (Android 13+); asked once, right after the warning it serves shows.
+        if (install && android.os.Build.VERSION.SDK_INT >= 33 && !p.getBoolean("notifAsked", false) &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            p.edit().putBoolean("notifAsked", true).apply()
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 2)
+        }
+    }
+
+    // Offers a newer GitHub release once per launch, until it's installed or skipped. Failures stay silent.
+    private fun checkUpdate() = thread {
+        val release = runCatching {
+            JSONObject(URL(RELEASES_API).openStream().bufferedReader().use { it.readText() })
+        }.getOrNull() ?: return@thread
+        val tag = release.optString("tag_name")
+        val page = release.optString("html_url").takeIf { it.startsWith("https://github.com/") } ?: return@thread
+        val current = packageManager.getPackageInfo(packageName, 0).versionName ?: return@thread
+        if (!isNewer(tag, current) || prefs(this).getString("skippedUpdate", null) == tag) return@thread
+        runOnUiThread {
+            if (isFinishing || isDestroyed) return@runOnUiThread
+            android.app.AlertDialog.Builder(this)
+                .setTitle(getString(R.string.update_title, tag))
+                .setMessage(R.string.update_message)
+                .setPositiveButton(R.string.update_download) { _, _ -> startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(page))) }
+                .setNegativeButton(R.string.update_skip) { _, _ -> prefs(this).edit().putString("skippedUpdate", tag).apply() }
+                .show()
+        }
+    }
+
+    override fun onDestroy() {
+        bar?.release()
+        client?.release()
+        web?.destroy() // e.g. on rotation: the old page must not keep loading in the background
+        super.onDestroy()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        CookieManager.getInstance().flush()
+    }
+
+    // Settings live here, on the phone, so they're not fiddled with while driving.
+    override fun onCreateOptionsMenu(menu: Menu): Boolean {
+        // The gear is white; tint it to the action bar's icon color so it shows in light mode too.
+        val tint = obtainStyledAttributes(intArrayOf(android.R.attr.colorControlNormal)).run {
+            getColorStateList(0).also { recycle() }
+        }
+        menu.add(R.string.settings)
+            .setIcon(getDrawable(R.drawable.ic_settings)!!.mutate().apply { setTintList(tint) })
+            .setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
+        return true
+    }
+
+    override fun onOptionsItemSelected(item: MenuItem): Boolean {
+        startActivity(Intent(this, SettingsActivity::class.java))
+        return true
+    }
+
+    // Phone mic: what's said becomes a search on the car screen.
+    private fun startPhoneVoice() {
+        val i = Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+            .putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL, android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            .putExtra(android.speech.RecognizerIntent.EXTRA_PROMPT, getString(R.string.voice_prompt))
+        runCatching { startActivityForResult(i, VOICE_REQUEST) }.onFailure {
+            android.widget.Toast.makeText(this, R.string.voice_unavailable, android.widget.Toast.LENGTH_LONG).show()
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != VOICE_REQUEST || resultCode != RESULT_OK) return
+        val q = data?.getStringArrayListExtra(android.speech.RecognizerIntent.EXTRA_RESULTS)?.firstOrNull()?.trim().orEmpty()
+        if (q.isNotEmpty()) sendCarSearch(this, car, q)
+    }
+}
+
+/**
+ * Share target: a YouTube link shared from any app (the YouTube app's Share > YT Auto) plays in the car, or waits
+ * for the car screen like a video tapped in the phone remote. No UI of its own: a toast, then gone.
+ */
+class ShareActivity : Activity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val id = sharedVideoId(intent.getStringExtra(Intent.EXTRA_TEXT) ?: intent.dataString)
+        val msg = when {
+            id == null -> R.string.share_no_video
+            carPlaying() -> R.string.video_sent
+            else -> R.string.video_saved
+        }
+        if (id != null) MediaController(this, mediaSession(this).sessionToken).transportControls.playFromMediaId(id, null)
+        android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_LONG).show()
+        finish()
+    }
+}
+
+/**
+ * Phone settings screen, same values as the car's SettingsScreen. Framework preferences (deprecated
+ * but built in) keep it native-looking without pulling in AppCompat/androidx.preference.
+ */
+@Suppress("DEPRECATION")
+class SettingsActivity : Activity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setTitle(R.string.settings)
+        actionBar?.setDisplayHomeAsUpEnabled(true)
+        if (savedInstanceState == null) {
+            fragmentManager.beginTransaction().replace(android.R.id.content, Prefs()).commit()
+        }
+    }
+
+    override fun onNavigateUp(): Boolean {
+        finish()
+        return true
+    }
+
+    class Prefs : android.preference.PreferenceFragment() {
+        override fun onCreate(savedInstanceState: Bundle?) {
+            super.onCreate(savedInstanceState)
+            preferenceManager.sharedPreferencesName = "settings" // same file prefs() uses
+            val ctx = activity
+            val screen = preferenceManager.createPreferenceScreen(ctx)
+            preferenceScreen = screen
+            fun category(title: Int) = android.preference.PreferenceCategory(ctx).also {
+                it.setTitle(title)
+                screen.addPreference(it)
+            }
+            fun list(c: Choice) = android.preference.ListPreference(ctx).apply {
+                key = c.key
+                setTitle(c.title)
+                setDialogTitle(c.title)
+                entries = c.options.values.map { ctx.getString(it) }.toTypedArray()
+                entryValues = c.options.keys.toTypedArray()
+                setDefaultValue(c.default)
+                value = choice(ctx, c) // also drops stale values to the default
+                summary = "%s" // shows the chosen option
+            }
+            fun switch(f: Flag) = android.preference.SwitchPreference(ctx).apply {
+                key = f.key
+                setTitle(f.title)
+                setDefaultValue(f.default)
+                // Turning audio-only on asks for the GPS speed it runs on (see YoutubeScreen.listenSpeed).
+                if (f.key == "audioWhileMoving") setOnPreferenceChangeListener { _, on ->
+                    if (on == true) ctx.requestLocation()
+                    true
+                }
+                // On-screen navigation reads Waze's and Maps' notifications (on by default). Turning it on without access
+                // keeps it on and opens the grant; turning it off always works (see onResume for the switch's state).
+                if (f.key == "navOverlay") setOnPreferenceChangeListener { _, on ->
+                    if (on == true && !ctx.navAccess()) ctx.startActivity(Intent(android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                    true
+                }
+            }
+            // Icons are white; tint them to the theme's icon color so they show in light mode too.
+
+            val tint = ctx.obtainStyledAttributes(intArrayOf(android.R.attr.colorControlNormal)).run {
+                getColorStateList(0).also { recycle() }
+            }
+            addTubeSetupTop(ctx, screen)
+            PHONE_GROUPS.forEach { (title, keys) ->
+                category(title).apply {
+                    keys.forEach { key ->
+                        val c = CHOICES.find { it.key == key }
+                        val p = if (c != null) list(c) else switch(FLAGS.first { it.key == key }).apply {
+                            setSummary(SWITCH_SUMMARIES.getValue(key))
+                        }
+                        p.icon = ctx.getDrawable(SETTING_ICONS.getValue(key))!!.mutate().apply { setTintList(tint) }
+                        addPreference(p)
+                    }
+                }
+            }
+            addTubeSetupBottom(ctx, screen)
+        }
+
+        // The switch shows whether on-screen navigation works: on by default, but without notification access it reads
+        // off, and turning it on asks for the access. Back from Android's access screen, access granted keeps it on.
+        override fun onResume() {
+            super.onResume()
+            val p = findPreference("navOverlay") as? android.preference.SwitchPreference ?: return
+            p.isChecked = navSwitchShown(flag(activity, "navOverlay"), activity.navAccess())
+        }
+    }
+}

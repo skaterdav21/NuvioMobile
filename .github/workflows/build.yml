@@ -1,0 +1,76 @@
+name: TubeAuto
+# Builds the TubeAuto APK (YouTube for Android Auto, based on YT Auto).
+#
+# Optional repository secrets (Settings > Secrets and variables > Actions):
+#   TUBEAUTO_KEYSTORE_B64   signing key (base64 .jks, password and alias "tubeauto"), so every build installs over
+#                           the last one. Without it each build gets a one-off key.
+#   TUBEAUTO_KEYSTORE_PASSWORD / TUBEAUTO_KEY_ALIAS / TUBEAUTO_KEY_PASSWORD   if the key uses other values
+#                           (to reuse the Nuvio Auto key: password and alias "nuvioauto").
+
+on:
+  push:
+    branches: [main, tubeauto]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tubeauto-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Signing key
+        env:
+          TUBEAUTO_KEYSTORE_B64: ${{ secrets.TUBEAUTO_KEYSTORE_B64 }}
+        shell: bash
+        run: |
+          keystore="$RUNNER_TEMP/tubeauto.jks"
+          if [ -n "$TUBEAUTO_KEYSTORE_B64" ]; then
+            printf '%s' "$TUBEAUTO_KEYSTORE_B64" | base64 --decode > "$keystore"
+          else
+            echo "::warning::TUBEAUTO_KEYSTORE_B64 is not set: this APK has a one-off key and won't install over other builds."
+            keytool -genkeypair -keystore "$keystore" -storetype PKCS12 -storepass tubeauto -keypass tubeauto \
+              -alias tubeauto -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=TubeAuto"
+          fi
+          echo "TUBEAUTO_KEYSTORE=$keystore" >> "$GITHUB_ENV"
+
+      - name: Build release APK
+        env:
+          TUBEAUTO_KEYSTORE_PASSWORD: ${{ secrets.TUBEAUTO_KEYSTORE_PASSWORD }}
+          TUBEAUTO_KEY_ALIAS: ${{ secrets.TUBEAUTO_KEY_ALIAS }}
+          TUBEAUTO_KEY_PASSWORD: ${{ secrets.TUBEAUTO_KEY_PASSWORD }}
+        run: |
+          # Empty secrets mean the defaults.
+          [ -z "$TUBEAUTO_KEYSTORE_PASSWORD" ] && unset TUBEAUTO_KEYSTORE_PASSWORD
+          [ -z "$TUBEAUTO_KEY_ALIAS" ] && unset TUBEAUTO_KEY_ALIAS
+          [ -z "$TUBEAUTO_KEY_PASSWORD" ] && unset TUBEAUTO_KEY_PASSWORD
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease --stacktrace
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          ls -la app/build/outputs/apk/release/
+          mkdir -p out
+          cp "$(ls app/build/outputs/apk/release/*.apk | head -n1)" "out/TubeAuto-${GITHUB_RUN_NUMBER}.apk"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          path: out/TubeAuto-${{ github.run_number }}.apk
+          archive: false
+          if-no-files-found: error
+          retention-days: 30

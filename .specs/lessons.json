@@ -1,0 +1,407 @@
+{
+  "schema": 1,
+  "promote_threshold": 2,
+  "window_days": 45,
+  "quarantine_threshold": 2,
+  "next_id": 23,
+  "lessons": [
+    {
+      "id": "L-001",
+      "key": "weak_test::when a criterion lists alternative input sources fallback chain give each alternative its own asserted case one green case leaves the others unpinned",
+      "text": "When a criterion lists alternative input sources (fallback chain), give each alternative its own asserted case; one green case leaves the others unpinned.",
+      "signal": "weak_test",
+      "scope": "parser",
+      "status": "candidate",
+      "features": [
+        "car-features-verification"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "FEED-08 / C8 (parser)"
+      ],
+      "created": "2026-11-10T22:34:43Z",
+      "last_seen": "2026-11-10T22:34:43Z"
+    },
+    {
+      "id": "L-002",
+      "key": "weak_test::when a criterion says a state is discarded test the round trip change away and back masking it against the current value passes a one way test",
+      "text": "When a criterion says a state is discarded, test the round trip (change away and back); masking it against the current value passes a one-way test.",
+      "signal": "weak_test",
+      "scope": "settings",
+      "status": "candidate",
+      "features": [
+        "video-fill"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "ASPECT-09 / C13 (settings)"
+      ],
+      "created": "2026-11-11T15:19:41Z",
+      "last_seen": "2026-11-11T15:19:41Z"
+    },
+    {
+      "id": "L-003",
+      "key": "ac_gap::a setting shown on both car and phone needs a proof for each surface the phone list is built separately from choices",
+      "text": "A setting shown on both car and phone needs a proof for each surface; the phone list is built separately from CHOICES.",
+      "signal": "ac_gap",
+      "scope": "settings",
+      "status": "candidate",
+      "features": [
+        "video-fill"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "ASPECT-06 / C10 (settings)"
+      ],
+      "created": "2026-11-11T15:19:41Z",
+      "last_seen": "2026-11-11T15:19:41Z"
+    },
+    {
+      "id": "L-004",
+      "key": "weak_test::a does not react to x failing check must make x fail in the walk observing the happy path proves nothing",
+      "text": "A 'does not react to X failing' check must make X fail in the walk; observing the happy path proves nothing.",
+      "signal": "weak_test",
+      "scope": "webview",
+      "status": "confirmed",
+      "features": [
+        "offline-screen",
+        "car-polish"
+      ],
+      "recurrence": 2,
+      "harmful": 0,
+      "evidence": [
+        "OFF-06 / C6 (webview)",
+        "THEME-04 / C13 (webview)"
+      ],
+      "created": "2026-11-11T16:01:23Z",
+      "last_seen": "2026-11-11T17:15:45Z"
+    },
+    {
+      "id": "L-005",
+      "key": "ac_gap::a retry forever loop needs its trigger narrowed to the errors a retry can cure list the excluded error codes in the spec",
+      "text": "A retry-forever loop needs its trigger narrowed to the errors a retry can cure; list the excluded error codes in the spec.",
+      "signal": "ac_gap",
+      "scope": "webview",
+      "status": "candidate",
+      "features": [
+        "offline-screen"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "OFF-09 (webview)"
+      ],
+      "created": "2026-11-11T16:01:23Z",
+      "last_seen": "2026-11-11T16:01:23Z"
+    },
+    {
+      "id": "L-006",
+      "key": "weak_test::a unit test must call the function the production path calls grep for callers before pointing a check at a helper",
+      "text": "A unit test must call the function the production path calls; grep for callers before pointing a check at a helper.",
+      "signal": "weak_test",
+      "scope": "webview",
+      "status": "candidate",
+      "features": [
+        "phone-remote"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "CAST-05 / C6 (webview)"
+      ],
+      "created": "2026-11-11T16:38:30Z",
+      "last_seen": "2026-11-11T16:38:30Z"
+    },
+    {
+      "id": "L-007",
+      "key": "gate_fail::never build android framework objects in top level vals of a file the jvm tests load use lazy or a function",
+      "text": "Never build Android framework objects in top-level vals of a file the JVM tests load; use lazy or a function.",
+      "signal": "gate_fail",
+      "scope": "jvm-tests",
+      "status": "candidate",
+      "features": [
+        "phone-remote"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "waitingForCar (jvm-tests)"
+      ],
+      "created": "2026-11-11T16:38:30Z",
+      "last_seen": "2026-11-11T16:38:30Z"
+    },
+    {
+      "id": "L-008",
+      "key": "weak_test::a pure function test of page state needs a walk that drives the real page into that state the function cannot see what the page reports",
+      "text": "A pure-function test of page state needs a walk that drives the real page into that state; the function cannot see what the page reports.",
+      "signal": "weak_test",
+      "scope": "webview",
+      "status": "candidate",
+      "features": [
+        "car-polish"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "PLAYBTN-02 / C2 (webview)"
+      ],
+      "created": "2026-11-11T17:15:45Z",
+      "last_seen": "2026-11-11T17:15:45Z"
+    },
+    {
+      "id": "L-009",
+      "key": "spec_deviation::when narrowing which element the page reports state from point every control at the same selector",
+      "text": "When narrowing which element the page reports state from, point every control at the same selector.",
+      "signal": "spec_deviation",
+      "scope": "webview",
+      "status": "candidate",
+      "features": [
+        "car-polish"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "YoutubeCarAppService.kt:171 (webview)"
+      ],
+      "created": "2026-11-11T17:15:45Z",
+      "last_seen": "2026-11-11T17:15:45Z"
+    },
+    {
+      "id": "L-010",
+      "key": "gate_fail::a theme given to a presentation or window brings its decor too pick a noactionbar variant and walk the screen edges after a theme change",
+      "text": "A theme given to a Presentation or window brings its decor too; pick a NoActionBar variant and walk the screen edges after a theme change.",
+      "signal": "gate_fail",
+      "scope": "webview",
+      "status": "candidate",
+      "features": [
+        "car-polish"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "THEME-01 / C21 (webview)"
+      ],
+      "created": "2026-11-11T17:18:32Z",
+      "last_seen": "2026-11-11T17:18:32Z"
+    },
+    {
+      "id": "L-011",
+      "key": "weak_test::to read a host from a webview url use java net url or uri host not java net uri chromium leaves unescaped in queries and uri throws on them test with such a url",
+      "text": "To read a host from a WebView URL use java.net.URL (or Uri.host), not java.net.URI: Chromium leaves | { } ^ unescaped in queries and URI throws on them; test with such a URL.",
+      "signal": "weak_test",
+      "scope": "webview",
+      "status": "candidate",
+      "features": [
+        "car-signin"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "C1 / SIGNIN-01 (webview)"
+      ],
+      "created": "2026-11-17T23:34:16Z",
+      "last_seen": "2026-11-17T23:34:16Z"
+    },
+    {
+      "id": "L-012",
+      "key": "weak_test::a screen criterion that names contents icon text buttons needs a walk or a data test of those contents a visibility rule unit test alone does not prove it",
+      "text": "A screen criterion that names contents (icon, text, buttons) needs a walk or a data test of those contents; a visibility-rule unit test alone does not prove it.",
+      "signal": "weak_test",
+      "scope": "ui",
+      "status": "candidate",
+      "features": [
+        "ui-polish"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "C4 / SIGN-04 (ui)"
+      ],
+      "created": "2026-11-18T00:34:07Z",
+      "last_seen": "2026-11-18T00:34:07Z"
+    },
+    {
+      "id": "L-013",
+      "key": "weak_test::when a car template must redraw after an action cite the walk that sees the redraw a unit test of the next state misses a missing invalidate",
+      "text": "When a car template must redraw after an action, cite the walk that sees the redraw; a unit test of the next state misses a missing invalidate().",
+      "signal": "weak_test",
+      "scope": "car-template",
+      "status": "candidate",
+      "features": [
+        "ui-polish"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "C14 / NAV-06 (car-template)"
+      ],
+      "created": "2026-11-18T00:34:07Z",
+      "last_seen": "2026-11-18T00:34:07Z"
+    },
+    {
+      "id": "L-014",
+      "key": "ac_gap::a gesture s starting value time position is read from the page when the gesture starts not from a polled copy a pure formula test does not cover where its input comes from",
+      "text": "A gesture's starting value (time, position) is read from the page when the gesture starts, not from a polled copy; a pure formula test does not cover where its input comes from.",
+      "signal": "ac_gap",
+      "scope": "car-gestures",
+      "status": "candidate",
+      "features": [
+        "video-controls"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "CTRL-14/CTRL-18 (car-gestures)"
+      ],
+      "created": "2026-11-18T15:11:02Z",
+      "last_seen": "2026-11-18T15:11:02Z"
+    },
+    {
+      "id": "L-015",
+      "key": "weak_test::a walk proof that names screenshots and a measured value needs those captured screenshot loop during the user s gesture not the user s verdict",
+      "text": "A walk proof that names screenshots and a measured value needs those captured (screenshot loop during the user's gesture), not the user's verdict.",
+      "signal": "weak_test",
+      "scope": "walk",
+      "status": "candidate",
+      "features": [
+        "video-controls"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "C15 (walk)"
+      ],
+      "created": "2026-11-18T15:11:03Z",
+      "last_seen": "2026-11-18T15:11:03Z"
+    },
+    {
+      "id": "L-016",
+      "key": "ac_gap::anything shown on the car screen in reaction to playback must check the video is on screen surface attached no audio cover background play keeps the page running behind other apps",
+      "text": "Anything shown on the car screen in reaction to playback must check the video is on screen (surface attached, no audio cover): background play keeps the page running behind other apps.",
+      "signal": "ac_gap",
+      "scope": "car-screen",
+      "status": "candidate",
+      "features": [
+        "gesture-hint"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "HINT-04 (car-screen)"
+      ],
+      "created": "2026-11-18T15:25:56Z",
+      "last_seen": "2026-11-18T15:25:56Z"
+    },
+    {
+      "id": "L-017",
+      "key": "gate_fail::a regex the jvm tests accept can crash on android s icu the u flag did at class load install and open the app after any regex change green unit tests prove nothing about android syntax",
+      "text": "A regex the JVM tests accept can crash on Android's ICU (the (?U) flag did at class load): install and open the app after any regex change, green unit tests prove nothing about Android syntax.",
+      "signal": "gate_fail",
+      "scope": "regex",
+      "status": "candidate",
+      "features": [
+        "nav-instruction"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "84bb4b5 / C10 (regex)"
+      ],
+      "created": "2026-11-18T21:58:45Z",
+      "last_seen": "2026-11-18T21:58:45Z"
+    },
+    {
+      "id": "L-018",
+      "key": "ac_gap::a setting that gates something already on the car screen must re apply it when the setting changes in the car and on the phone a pure off shows nothing test cannot see a stale view",
+      "text": "A setting that gates something already on the car screen must re-apply it when the setting changes, in the car and on the phone; a pure 'off shows nothing' test cannot see a stale view.",
+      "signal": "ac_gap",
+      "scope": "car-screen",
+      "status": "candidate",
+      "features": [
+        "nav-instruction"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "F1 / C19 (car-screen)"
+      ],
+      "created": "2026-11-18T21:58:45Z",
+      "last_seen": "2026-11-18T21:58:45Z"
+    },
+    {
+      "id": "L-019",
+      "key": "weak_test::when an ac lists player states walk every one end of video ad and hide youtube elements with their descendants not only the parent",
+      "text": "When an AC lists player states, walk every one (end of video, ad) and hide YouTube elements with their descendants, not only the parent.",
+      "signal": "weak_test",
+      "scope": "webview",
+      "status": "candidate",
+      "features": [
+        "player-controls"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "player-controls C1 (webview)"
+      ],
+      "created": "2026-11-19T13:18:36Z",
+      "last_seen": "2026-11-19T13:18:36Z"
+    },
+    {
+      "id": "L-020",
+      "key": "ac_gap::a timed car overlay that changes the page must run only while the video screen is in front and drawn and every strip action that leaves must stop it",
+      "text": "A timed car overlay that changes the page must run only while the video screen is in front and drawn, and every strip action that leaves must stop it.",
+      "signal": "ac_gap",
+      "scope": "car-overlay",
+      "status": "candidate",
+      "features": [
+        "video-end"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "video-end finding 4 (car-overlay)"
+      ],
+      "created": "2026-11-19T13:39:10Z",
+      "last_seen": "2026-11-19T13:39:10Z"
+    },
+    {
+      "id": "L-021",
+      "key": "weak_test::when two controls side strip steering wheel do the same thing route both through one helper and test the helper s output not a boolean",
+      "text": "When two controls (side strip, steering wheel) do the same thing, route both through one helper and test the helper's output, not a boolean.",
+      "signal": "weak_test",
+      "scope": "car-controls",
+      "status": "candidate",
+      "features": [
+        "prev-next"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "prev-next finding 1-2 (car-controls)"
+      ],
+      "created": "2026-11-19T14:02:11Z",
+      "last_seen": "2026-11-19T14:02:11Z"
+    },
+    {
+      "id": "L-022",
+      "key": "ac_gap::android auto binds the car app service on connect but the media browser only when the media card is used hook car connect logic on the session not only ongetroot",
+      "text": "Android Auto binds the car app service on connect but the media browser only when the media card is used; hook car-connect logic on the session, not only onGetRoot.",
+      "signal": "ac_gap",
+      "scope": "car-install",
+      "status": "candidate",
+      "features": [
+        "install-check"
+      ],
+      "recurrence": 1,
+      "harmful": 0,
+      "evidence": [
+        "install-check finding 2 (car-install)"
+      ],
+      "created": "2026-11-19T18:34:37Z",
+      "last_seen": "2026-11-19T18:34:37Z"
+    }
+  ]
+}
